@@ -8,7 +8,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 ```lua
 {
-  dir = '~/dev/overwatch.nvim', -- or '<org>/overwatch.nvim' once it's on GitHub
+  dir = 'cyalen/overwatch.nvim',
   dependencies = { 'lewis6991/gitsigns.nvim' },
   cmd = 'Overwatch',
   opts = {},
