@@ -112,15 +112,38 @@ end
 -- (new commits, a rebase, uncommitted agent edits) it comes back, diffed against the snapshot.
 ---------------------------------------------------------------------------
 
+-- Ticks: path -> snapshot commit, and path -> when you ticked it (seconds since the epoch; nil for
+-- ticks saved before times were recorded). Lines are "<commit> @<time> <path>" or "<commit> <path>".
 local function read_seen()
-  local seen = {}
+  local seen, at = {}, {}
   for _, l in ipairs(read(S.seen_file)) do
-    local c, p = l:match('^(%S+) (.+)$')
+    local c, t, p = l:match('^(%S+) @(%d+) (.+)$')
+    if not c then
+      c, p = l:match('^(%S+) (.+)$')
+    end
     if p then
-      seen[p] = c
+      seen[p], at[p] = c, tonumber(t)
     end
   end
-  return seen
+  return seen, at
+end
+
+-- '2026-11-13T16:02:24Z' -> seconds since the epoch, by plain calendar arithmetic (days from the
+-- civil date), so no time zone or daylight-saving rule gets involved.
+function M._utc_epoch(iso)
+  local y, m, d, hh, mm, ss = (iso or ''):match('(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)')
+  if not y then
+    return nil
+  end
+  y, m, d = tonumber(y), tonumber(m), tonumber(d)
+  if m <= 2 then
+    y = y - 1
+  end
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1
+  local days = era * 146097 + yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy - 719468
+  return days * 86400 + tonumber(hh) * 3600 + tonumber(mm) * 60 + tonumber(ss)
 end
 
 -- A commit holding the working tree as it is right now (HEAD when clean). Touches nothing.
@@ -133,14 +156,21 @@ end
 -- Unticking puts a file back how it was when this review opened (S.seen0), so undoing a misclick
 -- on a file from an earlier review restores that review's tick instead of forgetting it.
 local function set_seen(paths, on)
-  local seen, snap = read_seen(), on and snapshot() or nil
+  local seen, at = read_seen()
+  local snap, now = on and snapshot() or nil, os.time()
   for _, p in ipairs(paths) do
     local before = S.seen0[p]
-    seen[p] = on and snap or (before ~= seen[p] and before or nil)
+    if on then
+      seen[p], at[p] = snap, now
+    elseif before ~= seen[p] then
+      seen[p], at[p] = before, S.seen0_at[p]
+    else
+      seen[p], at[p] = nil, nil
+    end
   end
   local out = {}
   for p, c in pairs(seen) do
-    out[#out + 1] = c .. ' ' .. p
+    out[#out + 1] = at[p] and ('%s @%d %s'):format(c, at[p], p) or (c .. ' ' .. p)
   end
   table.sort(out)
   vim.fn.writefile(out, S.seen_file)
@@ -227,22 +257,26 @@ end
 -- new. Ticking during the review changes the tick, never the diff you're looking at.
 -- Refreshes S.bases, grows S.shown, and re-points open buffers to match.
 local function review_files()
-  local seen, cache, newer, files = read_seen(), {}, {}, numstat(S.base) or {}
+  local seen, seen_at = read_seen()
+  local cache, newer, files = {}, {}, numstat(S.base) or {}
   local waiting = {}
   for _, t in ipairs(S.threads) do
     waiting[t.path] = waiting[t.path] or t.waiting
   end
-  -- the newer of a local tick and your GitHub review
+  -- the newer of a local tick and your GitHub review: by history when the review's commit is still
+  -- an ancestor, else (after a rebase / force-push) by when you ticked vs when you submitted the review
   -- ponytail: a local tick older than that review loses to it, as on GitHub
-  local function baseline(snap)
+  local function baseline(snap, at)
     local r = S.reviewed
     if not (r and snap) then
       return snap or r
     end
-    if newer[snap] == nil then
-      newer[snap] = git('merge-base', '--is-ancestor', r, snap) ~= nil
+    local key = snap .. (at or '')
+    if newer[key] == nil then
+      local when = at or tonumber(git('show', '-s', '--format=%ct', snap) or '')
+      newer[key] = git('merge-base', '--is-ancestor', r, snap) ~= nil or (when or 0) > (S.reviewed_at or math.huge)
     end
-    return newer[snap] and snap or r
+    return newer[key] and snap or r
   end
   -- snapshot -> { path -> numstat } of what changed since it; false if the snapshot is gone
   -- (gc'd, or an older .seen format), which counts as never ticked
@@ -262,10 +296,10 @@ local function review_files()
   S.bases = {}
   for _, f in ipairs(files) do
     f.deleted = not vim.uv.fs_stat(S.root .. '/' .. f.path)
-    local b = baseline(seen[f.path])
+    local b = baseline(seen[f.path], seen_at[f.path])
     local d = b and since(b)
     f.state = not d and ' ' or d[f.path] and '~' or 'x'
-    local s0 = baseline(S.seen0[f.path])
+    local s0 = baseline(S.seen0[f.path], S.seen0_at[f.path])
     local d0 = s0 and since(s0)
     if d0 and d0[f.path] then
       f.since = s0
@@ -1031,6 +1065,7 @@ function M._begin(root, base, n, tab, pr, me)
     base = base,
     pr = pr,
     reviewed = reviewed,
+    reviewed_at = reviewed and M._utc_epoch(rv.submittedAt),
     threads = {},
     seen_file = file,
     tab = tab,
@@ -1039,7 +1074,7 @@ function M._begin(root, base, n, tab, pr, me)
     all = not M.opts.since_last_review,
   }
   ensure(root, file)
-  S.seen0 = read_seen()
+  S.seen0, S.seen0_at = read_seen()
 
   local gs = require('gitsigns')
   gs.change_base(base, true, function()

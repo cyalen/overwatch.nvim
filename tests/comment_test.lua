@@ -54,4 +54,10 @@ assert(#chains == 1 and #chains[1].items == 2 and chains[1].waiting, 'reply to a
 -- unlinked comments are their own chains
 assert(#ow._threads({ c(1, 'agent', '2026-01-01', 'a'), c(2, 'agent', '2026-01-02', 'b') }, 'me') == 2, 'unlinked: separate chains')
 
+-- review times: ISO (UTC) -> seconds since the epoch
+assert(ow._utc_epoch('1970-01-02T00:00:00Z') == 86400, tostring(ow._utc_epoch('1970-01-02T00:00:00Z')))
+assert(ow._utc_epoch('1970-01-01T00:00:00Z') == 0)
+assert(ow._utc_epoch('2026-11-13T16:02:24Z') == 1794585744, tostring(ow._utc_epoch('2026-11-13T16:02:24Z')))
+assert(ow._utc_epoch('2024-02-29T12:00:00Z') == 1709208000, 'leap day')
+
 print('ok')
