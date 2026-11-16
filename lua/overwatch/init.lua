@@ -196,16 +196,46 @@ local function apply_base(buf)
   end
 end
 
+-- Your latest submitted review on the PR. The empty COMMENTED reviews GitHub creates behind each
+-- single comment don't count: one comment mid-review isn't having reviewed the PR.
+function M._last_review(reviews, me)
+  local pick
+  for _, r in ipairs(reviews or {}) do
+    local submitted = r.state == 'APPROVED'
+      or r.state == 'CHANGES_REQUESTED'
+      or r.state == 'DISMISSED'
+      or r.state == 'COMMENTED' and (r.body or '') ~= ''
+    if submitted and r.author and r.author.login == me and r.commit and (not pick or r.submittedAt > pick.submittedAt) then
+      pick = r
+    end
+  end
+  return pick
+end
+
 -- Every file the PR changes, each with a tick state:
 --   ' '  not ticked
 --   '~'  ticked, but changed since
 --   'x'  ticked and unchanged
+-- Your last submitted GitHub review (S.reviewed) counts as a tick on every file, unless a local tick
+-- is newer.
 -- "Since last review" is measured from the ticks as they were when this review opened (S.seen0):
 -- a file changed since then gets that snapshot as its diff base (`since`) and counts only what's
 -- new. Ticking during the review changes the tick, never the diff you're looking at.
 -- Refreshes S.bases, grows S.shown, and re-points open buffers to match.
 local function review_files()
-  local seen, cache, files = read_seen(), {}, numstat(S.base) or {}
+  local seen, cache, newer, files = read_seen(), {}, {}, numstat(S.base) or {}
+  -- the newer of a local tick and your GitHub review
+  -- ponytail: a local tick older than that review loses to it, as on GitHub
+  local function baseline(snap)
+    local r = S.reviewed
+    if not (r and snap) then
+      return snap or r
+    end
+    if newer[snap] == nil then
+      newer[snap] = git('merge-base', '--is-ancestor', r, snap) ~= nil
+    end
+    return newer[snap] and snap or r
+  end
   -- snapshot -> { path -> numstat } of what changed since it; false if the snapshot is gone
   -- (gc'd, or an older .seen format), which counts as never ticked
   local function since(snap)
@@ -224,9 +254,10 @@ local function review_files()
   S.bases = {}
   for _, f in ipairs(files) do
     f.deleted = not vim.uv.fs_stat(S.root .. '/' .. f.path)
-    local d = seen[f.path] and since(seen[f.path])
+    local b = baseline(seen[f.path])
+    local d = b and since(b)
     f.state = not d and ' ' or d[f.path] and '~' or 'x'
-    local s0 = S.seen0[f.path]
+    local s0 = baseline(S.seen0[f.path])
     local d0 = s0 and since(s0)
     if d0 and d0[f.path] then
       f.since = s0
@@ -331,6 +362,13 @@ function M._fold(lnum)
   return S and S.nav_folds and S.nav_folds[lnum] or 0
 end
 
+function M._since_label()
+  if S.all then
+    return 'all changes'
+  end
+  return S.reviewed and ('since your review of ' .. S.reviewed:sub(1, 7)) or 'since last review'
+end
+
 local function nav_render()
   if not (S and S.nav and vim.api.nvim_buf_is_valid(S.nav) and nav_win()) then
     return
@@ -351,7 +389,7 @@ local function nav_render()
   local status = S.all and ('%d to review · all %d files · a: since'):format(queued, #files)
     or ('%d to review · %d unchanged hidden · a: all'):format(queued, #files - #shown)
   local rows = {
-    { line = { { what .. (S.all and ' · all changes' or ' · since last review'), 'Title' } } },
+    { line = { { what .. ' · ' .. M._since_label(), 'Title' } } },
     { line = { { status, 'Comment' } } },
   }
   S.nav_folds = { 0, 0 }
@@ -427,11 +465,17 @@ local function close_split()
 end
 
 -- Where files open: the current window if it's an ordinary one, else the side-by-side file pane,
--- the window you came from, or the first ordinary window. Never the file tree or a base pane.
+-- the window you came from, or the first ordinary window. Never the file tree, a base pane or the
+-- goto pane.
 local function file_window()
   local nav = nav_win()
   local function ok(w)
-    return w ~= 0 and w ~= nav and vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_config(w).relative == '' and not is_base_pane(w)
+    return w ~= 0
+      and w ~= nav
+      and w ~= (S and S.goto_win)
+      and vim.api.nvim_win_is_valid(w)
+      and vim.api.nvim_win_get_config(w).relative == ''
+      and not is_base_pane(w)
   end
   local wins, cur = vim.api.nvim_tabpage_list_wins(0), vim.api.nvim_get_current_win()
   if ok(cur) then
@@ -566,7 +610,8 @@ function M.files()
     foldtext = '',
     foldlevel = 99,
     foldcolumn = '1',
-    fillchars = 'fold: ,foldopen:▾,foldclose:▸,foldsep: ,eob: ',
+    -- foldinner: no nesting-level digits in the fold column for nested directories
+    fillchars = 'fold: ,foldopen:▾,foldclose:▸,foldsep: ,foldinner: ,eob: ',
   }
   for k, v in pairs(wo) do
     vim.wo[win][k] = v
@@ -761,44 +806,70 @@ function M.start(base, n, tab)
     return vim.notify('overwatch: not in a git repo', ERROR)
   end
   gh.pr(n, function(pr)
-    if not base then
-      local ref = pr and ('origin/' .. pr.baseRefName) or git('rev-parse', '--abbrev-ref', 'origin/HEAD')
-      base = ref and git('merge-base', 'HEAD', ref)
-      if not base then
-        return vim.notify('overwatch: no base found, pass one: :Overwatch <rev>', ERROR)
-      end
-    end
-    local file = seen_file(root)
-    S = { root = root, base = base, pr = pr, threads = {}, seen_file = file, tab = tab, bases = {}, shown = {}, all = not M.opts.since_last_review }
-    ensure(root, file)
-    S.seen0 = read_seen()
-
-    local gs = require('gitsigns')
-    gs.change_base(base, true, function()
-      vim.schedule(function()
-        if not S then
-          return
-        end
-        gs.toggle_linehl(true)
-        gs.toggle_word_diff(true)
-        for _, b in ipairs(vim.api.nvim_list_bufs()) do
-          vim.b[b].overwatch_base = nil -- the global change just put every buffer on `base`
-        end
-        local files = review_files()
-        local qf = set_qf(files)
-        if n and #qf > 0 then
-          vim.cmd.cfirst()
-        end
-        local todo = #vim.tbl_filter(to_review, files)
-        local what = pr and ('PR #' .. pr.number) or 'no PR'
-        vim.notify(('overwatch: %s · %d of %d files to review, %d hunks (%s)'):format(what, todo, #files, #qf, S.all and 'all changes' or 'since last review'))
-      end)
+    gh.me(function(me)
+      M._begin(root, base, n, tab, pr, me)
     end)
-    if pr and git('rev-parse', 'HEAD') ~= pr.headRefOid then
-      vim.notify('overwatch: local HEAD is not the PR head; comments may land on the wrong lines', WARN)
-    end
-    refresh()
   end)
+end
+
+function M._begin(root, base, n, tab, pr, me)
+  if not base then
+    local ref = pr and ('origin/' .. pr.baseRefName) or git('rev-parse', '--abbrev-ref', 'origin/HEAD')
+    base = ref and git('merge-base', 'HEAD', ref)
+    if not base then
+      return vim.notify('overwatch: no base found, pass one: :Overwatch <rev>', ERROR)
+    end
+  end
+  local file = seen_file(root)
+  local rv = pr and me and M._last_review(pr.reviews, me)
+  local reviewed = rv and rv.commit.oid
+  if reviewed and not git('cat-file', '-e', reviewed .. '^{commit}') then
+    git('fetch', '-q', 'origin', reviewed)
+    if not git('cat-file', '-e', reviewed .. '^{commit}') then
+      vim.notify(('overwatch: your last review was on %s, which isn\'t available locally; using your local ticks only'):format(reviewed:sub(1, 8)), WARN)
+      reviewed = nil
+    end
+  end
+  S = {
+    root = root,
+    base = base,
+    pr = pr,
+    reviewed = reviewed,
+    threads = {},
+    seen_file = file,
+    tab = tab,
+    bases = {},
+    shown = {},
+    all = not M.opts.since_last_review,
+  }
+  ensure(root, file)
+  S.seen0 = read_seen()
+
+  local gs = require('gitsigns')
+  gs.change_base(base, true, function()
+    vim.schedule(function()
+      if not S then
+        return
+      end
+      gs.toggle_linehl(true)
+      gs.toggle_word_diff(true)
+      for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        vim.b[b].overwatch_base = nil -- the global change just put every buffer on `base`
+      end
+      local files = review_files()
+      local qf = set_qf(files)
+      if n and #qf > 0 then
+        vim.cmd.cfirst()
+      end
+      local todo = #vim.tbl_filter(to_review, files)
+      local what = pr and ('PR #' .. pr.number) or 'no PR'
+      vim.notify(('overwatch: %s · %d of %d files to review, %d hunks (%s)'):format(what, todo, #files, #qf, M._since_label()))
+    end)
+  end)
+  if pr and git('rev-parse', 'HEAD') ~= pr.headRefOid then
+    vim.notify('overwatch: local HEAD is not the PR head; comments may land on the wrong lines', WARN)
+  end
+  refresh()
 end
 
 function M.stop()
@@ -943,7 +1014,10 @@ end
 -- The side-by-side view follows you: when the file pane moves to another file (<leader>rv, ]q,
 -- the tree, :e), swap the base pane for that file's; a non-file (deleted file view) closes it.
 local function follow_split(win, buf)
-  if not (S and S.split and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf) or is_base_pane(win) or win == nav_win() then
+  if not (S and S.split and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf) then
+    return
+  end
+  if is_base_pane(win) or win == nav_win() or win == S.goto_win then
     return
   end
   local rel = vim.bo[buf].buftype == '' and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(buf))
@@ -975,6 +1049,26 @@ function M._resplit(buf)
     vim.api.nvim_set_current_win(want.win)
     open_split()
   end
+end
+
+-- Goto during a review (wrap a telescope LSP picker, e.g. lsp_definitions): the result opens in one
+-- pane to the right, a plain editable buffer, so the file you're reviewing stays put. The lookup
+-- still uses your cursor in the review window. Outside a review it just runs the picker.
+-- ponytail: a lookup that finds nothing leaves a new pane showing the reviewed file
+function M.in_pane(picker)
+  if not S then
+    return picker()
+  end
+  local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+  if not (S.goto_win and vim.api.nvim_win_is_valid(S.goto_win)) then
+    S.goto_win = vim.api.nvim_open_win(buf, false, { split = 'right', win = win })
+    -- a split copies the review window's diff/scrollbind/fold settings; this pane is a plain one
+    for k, v in pairs({ diff = false, scrollbind = false, cursorbind = false, foldmethod = 'manual', foldenable = false }) do
+      vim.wo[S.goto_win][k] = v
+    end
+  end
+  vim.api.nvim_set_current_win(S.goto_win)
+  picker({ bufnr = buf, winnr = win })
 end
 
 -- ]q / [q: the next/previous change from the cursor, through the file and on into the next file

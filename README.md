@@ -8,7 +8,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 ```lua
 {
-  dir = 'cyalen/overwatch.nvim',
+  'cyalen/overwatch.nvim',
   dependencies = { 'lewis6991/gitsigns.nvim' },
   cmd = 'Overwatch',
   opts = {},
@@ -39,7 +39,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
    gitsigns diffs every buffer against the merge-base with the PR's base branch. `]c`/`[c` move between changes within a file. `]q`/`[q` move to the next or previous change after your cursor, carrying on into the next file.
 
-2. **Only what's new since your last review.** Say you reviewed commits A–C, which touched `x.sh` and `y.sh`, and ticked both. The agent then pushes commit D, which touches only `x.sh`. The next review shows just `x.sh`, diffed against what you saw, so only D's lines appear. Ticks are saved as you make them, and this survives rebases and force-pushes. To always open on the whole PR, set `opts = { since_last_review = false }`.
+2. **Only what's new since your last review.** "Your last review" is your last submitted review on GitHub (approve, request changes, or a comment with a body), or the files you ticked here, whichever is newer. Say you reviewed commits A–C, which touched `x.sh` and `y.sh`. The agent then pushes commit D, which touches only `x.sh`. The next review shows just `x.sh`, diffed against what you saw, so only D's lines appear. Ticks are saved as you make them, and this survives rebases and force-pushes. To always open on the whole PR, set `opts = { since_last_review = false }`.
 
    `<leader>rf` opens the file tree, a narrow directory tree with `+/-` counts and a `●` count of open PR threads. Each file shows:
    - `○` (gray): not reviewed;
@@ -56,6 +56,16 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
    Outside the tree, `<leader>rv` means "done with this file": it ticks the file and opens the next unreviewed one.
 
 3. **Side by side.** `<leader>rd` shows the full file next to its review base. It stays on as you move between files, until you press it again.
+
+   **Goto during a review.** Wrap your LSP goto pickers with `in_pane`. During a review, their results then open in one reusable pane to the right, as a normal editable buffer, and the file you're reviewing stays where it is. Outside a review the pickers behave as usual. With telescope:
+
+   ```lua
+   local pane = function(picker) return function() require('overwatch').in_pane(picker) end end
+   vim.keymap.set('n', 'grd', pane(require('telescope.builtin').lsp_definitions))
+   vim.keymap.set('n', 'grr', pane(require('telescope.builtin').lsp_references))
+   ```
+
+   It works with any picker that takes `{ bufnr, winnr }` for where to look up the symbol, and opens its result in the current window.
 
 4. **Comment on anything.** `<leader>rc` comments on the line or selection, and the comment goes straight to the PR.
    - **Lines the PR changed:** an ordinary line comment.

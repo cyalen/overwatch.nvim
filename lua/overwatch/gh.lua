@@ -21,11 +21,25 @@ end
 
 -- n: PR number, or nil for the current branch's PR. cb(nil) when there is none.
 function M.pr(n, cb)
-  local args = { 'pr', 'view', '--json', 'number,headRefName,headRefOid,baseRefName,url' }
+  local args = { 'pr', 'view', '--json', 'number,headRefName,headRefOid,baseRefName,url,reviews' }
   if n then
     table.insert(args, 3, tostring(n))
   end
   run(args, cb, function()
+    cb(nil)
+  end)
+end
+
+-- Your GitHub login (cached). cb(nil) if gh can't say.
+local me
+function M.me(cb)
+  if me then
+    return cb(me)
+  end
+  run({ 'api', 'user', '--jq', '.login' }, function(login)
+    me = vim.trim(tostring(login))
+    cb(me)
+  end, function()
     cb(nil)
   end)
 end
