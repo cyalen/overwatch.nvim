@@ -29,4 +29,13 @@ assert(select(1, ow._comment_lines('**L12:** one line')) == 12)
 -- a normal comment has no lines and keeps its text
 assert(ow._comment_lines('just a comment') == nil and ow._comment_text('just a comment') == 'just a comment')
 
+-- PR conversation: waiting = someone else wrote it after your latest comment; hidden ones drop out
+local function c(who, at, hidden) return { author = { login = who }, createdAt = at, isMinimized = hidden or false, body = '' } end
+local convo = ow._convo({ c('agent', '2026-01-03'), c('me', '2026-01-02'), c('agent', '2026-01-01'), c('agent', '2026-01-04', true) }, 'me')
+assert(#convo == 3, 'hidden comment dropped')
+assert(convo[1].createdAt == '2026-01-01' and convo[3].createdAt == '2026-01-03', 'date order')
+assert(not convo[1].waiting and not convo[2].waiting and convo[3].waiting, 'only what came after my latest comment waits')
+convo = ow._convo({ c('agent', '2026-01-01'), c('bot', '2026-01-02') }, 'me')
+assert(convo[1].waiting and convo[2].waiting, 'never commented: all of theirs waits')
+
 print('ok')

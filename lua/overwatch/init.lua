@@ -14,7 +14,8 @@ local PROMPT = 'Address the review feedback for this branch by following .overwa
 local SEP = '── reply ──'
 local SNIPPET_MAX = 20
 
-local S -- active review: { root, base, pr?, threads, seen_file, tab?, ... }
+local S -- active review: { root, base, pr?, threads, convo, seen_file, tab?, ... }
+local convo_render -- the PR conversation buffer's renderer, defined with it below
 
 -- Runs in the reviewed tree while a review is active, so switching tabs doesn't matter.
 local function git(...)
@@ -72,6 +73,9 @@ end
 local function render(buf)
   if not vim.api.nvim_buf_is_valid(buf) then
     return
+  end
+  if S and buf == S.convo_buf then
+    return convo_render()
   end
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   local rel = S and vim.bo[buf].buftype == '' and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(buf))
@@ -224,6 +228,10 @@ end
 -- Refreshes S.bases, grows S.shown, and re-points open buffers to match.
 local function review_files()
   local seen, cache, newer, files = read_seen(), {}, {}, numstat(S.base) or {}
+  local waiting = {}
+  for _, t in ipairs(S.threads) do
+    waiting[t.path] = waiting[t.path] or t.waiting
+  end
   -- the newer of a local tick and your GitHub review
   -- ponytail: a local tick older than that review loses to it, as on GitHub
   local function baseline(snap)
@@ -267,8 +275,9 @@ local function review_files()
       end
     end
     -- the "since" tree: whatever needed review when you opened it, plus anything that changes
-    -- while you're in it. Ticking doesn't remove a file, so you can see (and undo) what you ticked.
-    if f.state ~= 'x' then
+    -- while you're in it, plus files with a thread waiting on you. Ticking doesn't remove a file,
+    -- so you can see (and undo) what you ticked.
+    if f.state ~= 'x' or waiting[f.path] then
       S.shown[f.path] = true
     end
   end
@@ -392,7 +401,19 @@ local function nav_render()
     { line = { { what .. ' · ' .. M._since_label(), 'Title' } } },
     { line = { { status, 'Comment' } } },
   }
-  S.nav_folds = { 0, 0 }
+  if S.convo and #S.convo > 0 then
+    local waiting = #vim.tbl_filter(function(c)
+      return c.waiting
+    end, S.convo)
+    rows[#rows + 1] = {
+      convo = true,
+      line = { { '💬 PR conversation' }, { ' ●' .. #S.convo, waiting > 0 and 'DiagnosticWarn' or 'DiagnosticHint' } },
+    }
+  end
+  S.nav_folds = {}
+  for i = 1, #rows do
+    S.nav_folds[i] = 0
+  end
   for _, r in ipairs(tree_rows(shown)) do
     local pad = string.rep('  ', r.depth)
     if r.dir then
@@ -547,6 +568,113 @@ local function open_file(f)
   })
 end
 
+---------------------------------------------------------------------------
+-- PR conversation: comments on the PR itself rather than on code. In the tree it's a row; <CR> opens
+-- it in the main window, where <leader>rc replies, <leader>rx hides a comment as resolved and
+-- ]r / [r move between comments.
+---------------------------------------------------------------------------
+
+-- Unhidden comments in date order, each `waiting` when someone else wrote it after your own latest
+-- comment (all of theirs, if you never commented).
+function M._convo(comments, me)
+  local mine, out = '', {}
+  for _, c in ipairs(comments or {}) do
+    if not c.isMinimized then
+      out[#out + 1] = c
+      if c.author and c.author.login == me and c.createdAt > mine then
+        mine = c.createdAt
+      end
+    end
+  end
+  for _, c in ipairs(out) do
+    c.waiting = not (c.author and c.author.login == me) and c.createdAt > mine
+  end
+  table.sort(out, function(a, b)
+    return a.createdAt < b.createdAt
+  end)
+  return out
+end
+
+local function who(c)
+  return c.author and c.author.login or 'ghost'
+end
+
+convo_render = function()
+  local buf = S and S.convo_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return
+  end
+  local lines, rows, heads = {}, {}, {}
+  for _, c in ipairs(S.convo or {}) do
+    lines[#lines + 1] = ('@%s · %s'):format(who(c), (c.createdAt:gsub('T', ' ')):sub(1, 16))
+    heads[#heads + 1] = { #lines, c }
+    rows[#lines] = c
+    for _, l in ipairs(vim.split((c.body:gsub('\r', '')), '\n')) do
+      lines[#lines + 1] = l
+      rows[#lines] = c
+    end
+    lines[#lines + 1] = ''
+  end
+  if #lines == 0 then
+    lines = { 'No PR-level comments.' }
+  end
+  S.convo_rows, S.convo_heads = rows, heads
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  for _, h in ipairs(heads) do
+    vim.api.nvim_buf_set_extmark(buf, ns, h[1] - 1, 0, {
+      sign_text = '●',
+      sign_hl_group = h[2].waiting and 'DiagnosticWarn' or 'DiagnosticHint',
+      end_col = #lines[h[1]],
+      hl_group = 'Title',
+    })
+  end
+end
+
+-- Open the conversation in the main window, on the first comment waiting on you (else the last).
+local function open_convo()
+  if not (S.convo_buf and vim.api.nvim_buf_is_valid(S.convo_buf)) then
+    S.convo_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[S.convo_buf].filetype = 'markdown'
+    pcall(vim.api.nvim_buf_set_name, S.convo_buf, 'overwatch://conversation')
+  end
+  local target = file_window()
+  if not target then
+    vim.cmd('rightbelow vnew')
+    target = vim.api.nvim_get_current_win()
+  end
+  vim.api.nvim_set_current_win(target)
+  vim.api.nvim_win_set_buf(target, S.convo_buf)
+  convo_render()
+  local land
+  for _, h in ipairs(S.convo_heads) do
+    land = land or (h[2].waiting and h[1])
+  end
+  land = land or (S.convo_heads[#S.convo_heads] or { 1 })[1]
+  vim.api.nvim_win_set_cursor(target, { land, 0 })
+end
+
+-- Once, on start: with no code to review but PR comments waiting on you, open the conversation.
+-- Runs when both the quickfix (S.empty) and the comments (S.convo) are known, whichever is last.
+local function maybe_open_convo()
+  if not (S and S.convo and S.empty ~= nil) or S.convo_checked then
+    return
+  end
+  S.convo_checked = true
+  local n = #vim.tbl_filter(function(c)
+    return c.waiting
+  end, S.convo)
+  if n == 0 then
+    return
+  end
+  if S.empty then
+    open_convo()
+  end
+  vim.notify(('overwatch: %d PR-level comment%s waiting on you%s'):format(n, n == 1 and '' or 's', S.empty and '' or ' (💬 in the file tree)'))
+end
+
 function M.files()
   if not S then
     return vim.notify('overwatch: start a review first', WARN)
@@ -566,7 +694,9 @@ function M.files()
     end
     map('<CR>', function()
       local r = under_cursor()
-      if r and r.file then
+      if r and r.convo then
+        open_convo()
+      elseif r and r.file then
         open_file(r.file)
       elseif r and r.dir then
         vim.cmd('normal! za')
@@ -672,9 +802,10 @@ local function refresh()
   if not (S and S.pr) then
     return render_all()
   end
-  gh.threads(S.pr.number, function(nodes, me)
+  gh.threads(S.pr.number, function(nodes, me, comments)
     if S then
       S.me = me
+      S.convo = M._convo(comments, me)
       S.threads = vim.tbl_filter(function(t)
         return not t.isResolved
       end, nodes)
@@ -693,6 +824,7 @@ local function refresh()
         t.waiting = not (last and last.author and last.author.login == me)
       end
       render_all()
+      maybe_open_convo()
     end
   end)
 end
@@ -858,12 +990,14 @@ function M._begin(root, base, n, tab, pr, me)
       end
       local files = review_files()
       local qf = set_qf(files)
+      S.empty = #qf == 0
       if n and #qf > 0 then
         vim.cmd.cfirst()
       end
       local todo = #vim.tbl_filter(to_review, files)
       local what = pr and ('PR #' .. pr.number) or 'no PR'
       vim.notify(('overwatch: %s · %d of %d files to review, %d hunks (%s)'):format(what, todo, #files, #qf, M._since_label()))
+      maybe_open_convo()
     end)
   end)
   if pr and git('rev-parse', 'HEAD') ~= pr.headRefOid then
@@ -877,7 +1011,7 @@ function M.stop()
   gs.reset_base(true)
   gs.toggle_linehl(false)
   gs.toggle_word_diff(false)
-  local tab, nav = S and S.tab, S and S.nav
+  local tab, nav, convo = S and S.tab, S and S.nav, S and S.convo_buf
   S = nil
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     vim.b[b].overwatch_base = nil
@@ -888,6 +1022,9 @@ function M.stop()
       pcall(vim.api.nvim_win_close, w, true)
     end
     pcall(vim.api.nvim_buf_delete, nav, { force = true })
+  end
+  if convo and vim.api.nvim_buf_is_valid(convo) then
+    pcall(vim.api.nvim_buf_delete, convo, { force = true })
   end
   if tab and vim.api.nvim_tabpage_is_valid(tab) and #vim.api.nvim_list_tabpages() > 1 then
     pcall(vim.cmd.tabclose, vim.api.nvim_tabpage_get_number(tab))
@@ -1146,6 +1283,15 @@ function M.comment()
   if not (S and S.pr) then
     return vim.notify('overwatch: start a review on a branch with a PR first', WARN)
   end
+  if vim.api.nvim_get_current_buf() == S.convo_buf then
+    -- a reply links the comment under the cursor, so the agent knows what you're answering
+    local c = S.convo_rows and S.convo_rows[vim.fn.line('.')]
+    local context = c and vim.list_extend({ '@' .. who(c) .. ':' }, vim.split((c.body:gsub('\r', '')), '\n')) or {}
+    return input(c and 'Reply on the PR conversation' or 'PR comment', context, function(text)
+      local body = table.concat(text, '\n')
+      gh.pr_comment(S.pr.number, c and ('Re: ' .. c.url .. '\n\n' .. body) or body, refresh)
+    end)
+  end
   local l1, l2 = range()
   local _, rel = here()
   if not rel then
@@ -1168,8 +1314,18 @@ function M.comment()
   end)
 end
 
--- Resolve the PR thread on this line.
+-- Resolve the PR thread on this line; in the conversation, hide the comment as resolved.
 function M.resolve()
+  if S and vim.api.nvim_get_current_buf() == S.convo_buf then
+    local c = S.convo_rows and S.convo_rows[vim.fn.line('.')]
+    if not c then
+      return vim.notify('overwatch: no comment under the cursor', WARN)
+    end
+    return gh.hide(c.id, function()
+      vim.notify('overwatch: hid @' .. who(c) .. "'s comment as resolved")
+      refresh()
+    end)
+  end
   local _, rel = here()
   if not rel then
     return

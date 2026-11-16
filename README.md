@@ -77,11 +77,13 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 5. **Whose turn.** A `●` in the sign column marks each open thread, on the lines it's about (outdated threads sit at their original line). `]r`/`[r` cycle through them in a file. A thread is purple while you had the last word, and yellow once the agent (or anyone else) replies. The tree's `●` counts turn yellow the same way. Verify the fix, then `<leader>rx` resolves the thread. The agent never resolves anything itself.
 
-6. **Hand off.** `<leader>ra` copies the agent prompt. Paste it into any agent.
+6. **PR conversation.** Comments on the PR itself, rather than on code, live in the file tree as a `💬 PR conversation ●N` row, which is yellow when someone else spoke last. `<CR>` opens the conversation in the main window. There, `]r`/`[r` move between comments, and `<leader>rc` replies, linking the comment under the cursor so the agent knows what you're answering. `<leader>rx` hides a comment on GitHub as resolved. If a review starts with no code to look at but comments waiting on you, the conversation opens by itself. Files with a thread waiting on you show in the tree even when their code hasn't changed.
 
-7. **Verdict.** `<leader>rs` approves, requests changes, or leaves a review comment.
+7. **Hand off.** `<leader>ra` copies the agent prompt. Paste it into any agent.
 
-Comments posted to the main conversation (point 4, for files the PR doesn't touch) aren't shown inline. The agent still picks them up.
+8. **Verdict.** `<leader>rs` approves, requests changes, or leaves a review comment.
+
+Comments posted to the main conversation (point 4, for files the PR doesn't touch) appear in the PR conversation (point 6), not inline in the file.
 
 ## Bring your own agent
 

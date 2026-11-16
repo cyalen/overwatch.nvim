@@ -14,7 +14,7 @@ A reviewer has gone over this branch in Neovim with overwatch.nvim and left thei
    Does this need to be its own function?
    ````
 
-3. **Conversation comments**: the same shape, posted in the PR's main conversation, for code in files the PR doesn't touch at all. GitHub doesn't allow review comments on those files.
+3. **Conversation comments**: comments in the PR's main conversation. Some have the same link-and-code shape, for code in files the PR doesn't touch (GitHub doesn't allow review comments on those files). Others are about the PR as a whole.
 
 Your job is to work through every item the way a competent engineer answers a senior reviewer. Fix what's wrong. Push back where you disagree. Ask when you're stuck. Leave a written trail on the PR, where the reviewer will look.
 
@@ -46,7 +46,7 @@ query($owner:String!, $repo:String!, $pr:Int!) {
           comments(first:50) { nodes { databaseId author { login } body } }
         }
       }
-      comments(last:100) { nodes { databaseId url author { login } body } }
+      comments(last:100) { nodes { id databaseId url author { login } body isMinimized } }
     }
   }
 }'
@@ -57,7 +57,7 @@ query($owner:String!, $repo:String!, $pr:Int!) {
 - `subjectType: FILE` threads are file comments. Their lines are in the link that starts the first comment. The code block shows what those lines held, so use it to find the code if it has moved.
 - `isOutdated: true` means the code under the comment has changed since. Still address it, and say in your reply that the line moved.
 
-**Conversation comments** (`comments`): only the reviewer's comments that *start with a link to code* are work items. A comment is **open** if no later comment of yours replies to it, which you do by linking its `url` (see step 5). Ignore other conversation comments, including CI bots and general discussion.
+**Conversation comments** (`comments`): every comment from the reviewer is a work item, except ones hidden as resolved (`isMinimized: true`). A comment is **open** if no later comment of yours replies to it, which you do by linking its `url` (see step 5). A reviewer comment that starts with `Re: <url>` is a follow-up to the comment at that url. Ignore comments from anyone else, such as CI bots.
 
 Read each item in full, including every reply. The latest reviewer comment is the current ask.
 
@@ -130,7 +130,7 @@ gh pr comment $PR --body "Re: <the comment's url>
 **Never close anything.** Do not:
 
 - resolve a thread;
-- hide or edit the reviewer's comments;
+- hide (including "hide as resolved") or edit the reviewer's comments;
 - submit a PR review (approve, request changes) or merge.
 
 Resolving is the reviewer's signal that they verified your work, and it's the only signal they have.

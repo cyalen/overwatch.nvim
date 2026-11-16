@@ -59,15 +59,28 @@ query($owner:String!, $repo:String!, $pr:Int!) {
           comments(first:50) { nodes { databaseId author { login } body } }
         }
       }
+      comments(last:100) { nodes { id url author { login } body createdAt isMinimized } }
     }
   }
 }]]
 
--- cb(threads, your login). ponytail: first 100 threads only, paginate if a PR ever has more
+-- cb(review threads, your login, PR conversation comments).
+-- ponytail: first 100 threads / last 100 comments only, paginate if a PR ever has more
 function M.threads(pr, cb)
   run({ 'api', 'graphql', '-F', 'owner={owner}', '-F', 'repo={repo}', '-F', 'pr=' .. pr, '-f', 'query=' .. THREADS }, function(d)
-    cb(d.data.repository.pullRequest.reviewThreads.nodes, d.data.viewer.login)
+    local p = d.data.repository.pullRequest
+    cb(p.reviewThreads.nodes, d.data.viewer.login, p.comments.nodes)
   end)
+end
+
+-- A comment in the PR's main conversation.
+function M.pr_comment(n, body, cb)
+  run({ 'api', ('repos/{owner}/{repo}/issues/%d/comments'):format(n), '-f', 'body=' .. body }, cb)
+end
+
+-- Hide a conversation comment as Resolved (GitHub's way of resolving one).
+function M.hide(id, cb)
+  run({ 'api', 'graphql', '-f', 'id=' .. id, '-f', 'query=mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:RESOLVED}){minimizedComment{isMinimized}}}' }, cb)
 end
 
 -- Body of a file comment standing in for a line comment GitHub won't take (lines outside the
@@ -107,7 +120,7 @@ function M.comment(pr, c, cb)
       if not err2:find('422') then
         return failed(err2)
       end
-      run({ 'api', ('repos/{owner}/{repo}/issues/%d/comments'):format(pr.number), '-f', 'body=' .. body }, function(d)
+      M.pr_comment(pr.number, body, function(d)
         vim.notify(('overwatch: %s isn\'t part of the PR, so that went to the PR conversation'):format(c.path))
         if cb then
           cb(d)
