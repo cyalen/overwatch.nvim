@@ -1115,28 +1115,59 @@ function M.pr(n)
   end)
 end
 
--- Full-file side-by-side for the file window, against the file's review base.
-local function open_split()
+-- Full-file side-by-side for the file window, against the file's review base. Says why when nothing
+-- can be shown, unless quiet (when it's only following you between files).
+local function open_split(quiet)
   local w = file_window()
   if not w then
     return
   end
   vim.api.nvim_set_current_win(w)
-  local rel = S and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(0))
-  require('gitsigns').diffthis(rel and base_for(rel) or nil, { vertical = true }, function()
+  local buf = vim.api.nvim_win_get_buf(w)
+  local function why(msg)
+    if not quiet then
+      vim.notify('overwatch: ' .. msg, WARN)
+    end
+  end
+  if vim.bo[buf].buftype ~= '' then
+    return why('side-by-side needs a file in the repo, not ' .. vim.api.nvim_buf_get_name(buf))
+  end
+  -- gitsigns silently refuses a window still in diff mode, e.g. left over after its base pane closed
+  if vim.wo[w].diff then
+    vim.cmd.diffoff()
+  end
+  local sd = vim.b[buf].gitsigns_status_dict
+  if not (sd and sd.added) then
+    if not S then
+      return why("gitsigns isn't tracking this file")
+    end
+    -- just opened, and gitsigns hasn't attached yet: finish when it has (GitSignsUpdate, in setup)
+    S.split_for = { win = w, buf = buf, quiet = quiet }
+    return
+  end
+  local rel = S and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(buf))
+  local base = rel and base_for(rel) or nil
+  require('gitsigns').diffthis(base, { vertical = true }, function(err)
     vim.schedule(function()
+      local shown = false
       for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        shown = shown or is_base_pane(win)
         if vim.wo[win].diff then
           vim.wo[win].foldenable = false
         end
+      end
+      if not shown then
+        local at = base and (' at ' .. base:sub(1, 7)) or ''
+        why(('nothing to compare %s against%s%s'):format(rel or 'this file', at, err and (' (' .. tostring(err) .. ')') or ''))
       end
     end)
   end)
 end
 
--- Toggle side-by-side. It's a mode: it stays on as you move between files until toggled off.
+-- Toggle side-by-side by what's on screen: base panes showing, close them; otherwise open one. It's
+-- a mode: once on, it follows you between files until you toggle it off.
 function M.diff()
-  if close_split() or (S and S.split) then
+  if close_split() then
     if S then
       S.split = false
     end
@@ -1168,7 +1199,7 @@ local function follow_split(win, buf)
   if rel then
     -- diffthis needs gitsigns attached, and a file that was just opened isn't yet: finish on its
     -- first update (see setup)
-    S.split_for = { win = win, buf = buf }
+    S.split_for = { win = win, buf = buf, quiet = true }
     local sd = vim.b[buf].gitsigns_status_dict
     if sd and sd.added then
       M._resplit(buf)
@@ -1184,7 +1215,7 @@ function M._resplit(buf)
   S.split_for = nil
   if vim.api.nvim_win_is_valid(want.win) and vim.api.nvim_win_get_buf(want.win) == buf then
     vim.api.nvim_set_current_win(want.win)
-    open_split()
+    open_split(want.quiet)
   end
 end
 
