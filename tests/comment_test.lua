@@ -29,13 +29,29 @@ assert(select(1, ow._comment_lines('**L12:** one line')) == 12)
 -- a normal comment has no lines and keeps its text
 assert(ow._comment_lines('just a comment') == nil and ow._comment_text('just a comment') == 'just a comment')
 
--- PR conversation: waiting = someone else wrote it after your latest comment; hidden ones drop out
-local function c(who, at, hidden) return { author = { login = who }, createdAt = at, isMinimized = hidden or false, body = '' } end
-local convo = ow._convo({ c('agent', '2026-01-03'), c('me', '2026-01-02'), c('agent', '2026-01-01'), c('agent', '2026-01-04', true) }, 'me')
-assert(#convo == 3, 'hidden comment dropped')
-assert(convo[1].createdAt == '2026-01-01' and convo[3].createdAt == '2026-01-03', 'date order')
-assert(not convo[1].waiting and not convo[2].waiting and convo[3].waiting, 'only what came after my latest comment waits')
-convo = ow._convo({ c('agent', '2026-01-01'), c('bot', '2026-01-02') }, 'me')
-assert(convo[1].waiting and convo[2].waiting, 'never commented: all of theirs waits')
+-- PR conversation chains: `Re: <url>` and quote replies join the comment they answer
+local function c(id, who, at, body, hidden)
+  return { id = 'C' .. id, url = 'https://github.com/o/r/pull/1#issuecomment-' .. id, author = { login = who }, createdAt = at, body = body, isMinimized = hidden or false }
+end
+local chains = ow._threads({
+  c(1, 'agent', '2026-01-01', 'Rebased onto main and force-pushed.'),
+  c(2, 'me', '2026-01-02', 'Re: https://github.com/o/r/pull/1#issuecomment-1\n\nwhy rebase?'),
+  c(3, 'agent', '2026-01-03', 'Re: https://github.com/o/r/pull/1#issuecomment-2\n\nmain moved'), -- reply to a reply
+  c(4, 'agent', '2026-01-04', 'Unrelated: CI is green.'),
+  c(5, 'me', '2026-01-05', '> Unrelated: CI is green.\n\nnice'), -- GitHub Quote reply
+  c(6, 'agent', '2026-01-06', 'Re: https://example.invalid/whatever#issuecomment-4\nsame chain, other url'),
+}, 'me')
+assert(#chains == 2, 'two chains, got ' .. #chains)
+assert(chains[1].root.id == 'C1' and #chains[1].items == 3, 'Re: chain incl. reply to a reply')
+assert(chains[1].waiting, 'agent spoke last in chain 1')
+assert(chains[2].root.id == 'C4' and #chains[2].items == 3, 'quote reply and issuecomment-id match join chain 2')
+assert(chains[2].waiting, 'agent spoke last in chain 2')
+assert(ow._threads({ c(1, 'agent', '2026-01-01', 'a'), c(2, 'me', '2026-01-02', 'Re: x#issuecomment-1') }, 'me')[1].waiting == false, 'my last word: not waiting')
+-- hidden: a fully hidden chain drops out; a new reply brings it back
+assert(#ow._threads({ c(1, 'agent', '2026-01-01', 'a', true), c(2, 'me', '2026-01-02', 'Re: x#issuecomment-1', true) }, 'me') == 0, 'fully hidden chain dropped')
+chains = ow._threads({ c(1, 'agent', '2026-01-01', 'a', true), c(2, 'agent', '2026-01-03', 'Re: x#issuecomment-1\nmore') }, 'me')
+assert(#chains == 1 and #chains[1].items == 2 and chains[1].waiting, 'reply to a resolved chain reopens it')
+-- unlinked comments are their own chains
+assert(#ow._threads({ c(1, 'agent', '2026-01-01', 'a'), c(2, 'agent', '2026-01-02', 'b') }, 'me') == 2, 'unlinked: separate chains')
 
 print('ok')

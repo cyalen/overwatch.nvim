@@ -574,44 +574,104 @@ end
 -- ]r / [r move between comments.
 ---------------------------------------------------------------------------
 
--- Unhidden comments in date order, each `waiting` when someone else wrote it after your own latest
--- comment (all of theirs, if you never commented).
-function M._convo(comments, me)
-  local mine, out = '', {}
+-- The PR conversation as chains. GitHub's conversation is flat, so chains are rebuilt from the
+-- comments themselves: a reply starts with `Re: <url>` (replies from nvim and agents), or quotes an
+-- earlier comment (GitHub's Quote reply); anything else starts its own chain. Each chain is
+-- { root, items (date order), waiting = the last word isn't yours }. Chains whose comments are all
+-- hidden as resolved are dropped; a new reply to one brings it back.
+local function norm(text)
+  return vim.trim((text or ''):gsub('\r', ''):gsub('%s+', ' '))
+end
+
+function M._threads(comments, me)
+  local all, by_id, parent = {}, {}, {}
   for _, c in ipairs(comments or {}) do
-    if not c.isMinimized then
-      out[#out + 1] = c
-      if c.author and c.author.login == me and c.createdAt > mine then
-        mine = c.createdAt
-      end
+    all[#all + 1] = c
+    local id = (c.url or ''):match('issuecomment%-(%d+)')
+    if id then
+      by_id[id] = c
     end
   end
-  for _, c in ipairs(out) do
-    c.waiting = not (c.author and c.author.login == me) and c.createdAt > mine
-  end
-  table.sort(out, function(a, b)
+  table.sort(all, function(a, b)
     return a.createdAt < b.createdAt
   end)
-  return out
+  for i, c in ipairs(all) do
+    local body = (c.body or ''):gsub('\r', '')
+    local id = body:match('^%s*Re:%s*%S-issuecomment%-(%d+)')
+    local p = id and by_id[id]
+    if not p then
+      local quote = {}
+      for l in vim.gsplit(body, '\n') do
+        local q = l:match('^>%s?(.*)$')
+        if not q then
+          break
+        end
+        quote[#quote + 1] = q
+      end
+      local q = norm(table.concat(quote, ' '))
+      for j = i - 1, 1, -1 do
+        if q ~= '' and norm(all[j].body):find(q, 1, true) then
+          p = all[j]
+          break
+        end
+      end
+    end
+    parent[c] = p ~= c and p or nil
+  end
+  local chains, of = {}, {}
+  for _, c in ipairs(all) do
+    local r, seen = c, {}
+    while parent[r] and not seen[r] do
+      seen[r] = true
+      r = parent[r]
+    end
+    if not of[r] then
+      of[r] = { root = r, items = {} }
+      chains[#chains + 1] = of[r]
+    end
+    table.insert(of[r].items, c)
+  end
+  return vim.tbl_filter(function(t)
+    local last = t.items[#t.items]
+    t.waiting = not (last.author and last.author.login == me)
+    for _, c in ipairs(t.items) do
+      if not c.isMinimized then
+        return true
+      end
+    end
+    return false
+  end, chains)
 end
 
 local function who(c)
   return c.author and c.author.login or 'ghost'
 end
 
+-- One entry per chain: the first comment, then its replies indented under it (their `Re:` line
+-- dropped, the indent says it). One sign per chain, on its first line, so ]r / [r go chain to chain.
 convo_render = function()
   local buf = S and S.convo_buf
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
     return
   end
-  local lines, rows, heads = {}, {}, {}
-  for _, c in ipairs(S.convo or {}) do
-    lines[#lines + 1] = ('@%s · %s'):format(who(c), (c.createdAt:gsub('T', ' ')):sub(1, 16))
-    heads[#heads + 1] = { #lines, c }
-    rows[#lines] = c
-    for _, l in ipairs(vim.split((c.body:gsub('\r', '')), '\n')) do
-      lines[#lines + 1] = l
-      rows[#lines] = c
+  local lines, rows, heads, headers = {}, {}, {}, {}
+  for _, t in ipairs(S.convo or {}) do
+    for k, c in ipairs(t.items) do
+      local row = { comment = c, thread = t }
+      local when = (c.createdAt:gsub('T', ' ')):sub(1, 16)
+      lines[#lines + 1] = ('%s@%s · %s%s'):format(k > 1 and '  ↳ ' or '', who(c), when, c.isMinimized and ' · resolved' or '')
+      rows[#lines], headers[#lines] = row, c
+      if k == 1 then
+        heads[#heads + 1] = { #lines, t }
+      end
+      local body = (c.body or ''):gsub('\r', '')
+      if k > 1 then
+        body = body:gsub('^%s*Re:%s*%S+[ \t]*\n?[ \t]*\n?', '')
+      end
+      for _, l in ipairs(vim.split(body, '\n')) do
+        lines[#lines + 1] = (k > 1 and '    ' or '') .. l
+        rows[#lines] = row
+      end
     end
     lines[#lines + 1] = ''
   end
@@ -623,17 +683,21 @@ convo_render = function()
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  -- header highlights live apart from `ns`, whose marks are what ]r / [r stop on (one per chain)
+  local hl = vim.api.nvim_create_namespace('overwatch_convo')
+  vim.api.nvim_buf_clear_namespace(buf, hl, 0, -1)
+  for lnum, c in pairs(headers) do
+    vim.api.nvim_buf_set_extmark(buf, hl, lnum - 1, 0, { end_col = #lines[lnum], hl_group = c.isMinimized and 'Comment' or 'Title' })
+  end
   for _, h in ipairs(heads) do
     vim.api.nvim_buf_set_extmark(buf, ns, h[1] - 1, 0, {
       sign_text = '●',
       sign_hl_group = h[2].waiting and 'DiagnosticWarn' or 'DiagnosticHint',
-      end_col = #lines[h[1]],
-      hl_group = 'Title',
     })
   end
 end
 
--- Open the conversation in the main window, on the first comment waiting on you (else the last).
+-- Open the conversation in the main window, on the first chain waiting on you (else the last).
 local function open_convo()
   if not (S.convo_buf and vim.api.nvim_buf_is_valid(S.convo_buf)) then
     S.convo_buf = vim.api.nvim_create_buf(false, true)
@@ -657,7 +721,7 @@ local function open_convo()
 end
 
 -- Once, on start: with no code to review but PR comments waiting on you, open the conversation.
--- Runs when both the quickfix (S.empty) and the comments (S.convo) are known, whichever is last.
+-- Runs when both the quickfix (S.empty) and the chains (S.convo) are known, whichever is last.
 local function maybe_open_convo()
   if not (S and S.convo and S.empty ~= nil) or S.convo_checked then
     return
@@ -672,7 +736,7 @@ local function maybe_open_convo()
   if S.empty then
     open_convo()
   end
-  vim.notify(('overwatch: %d PR-level comment%s waiting on you%s'):format(n, n == 1 and '' or 's', S.empty and '' or ' (💬 in the file tree)'))
+  vim.notify(('overwatch: %d PR-level discussion%s waiting on you%s'):format(n, n == 1 and '' or 's', S.empty and '' or ' (💬 in the file tree)'))
 end
 
 function M.files()
@@ -805,7 +869,7 @@ local function refresh()
   gh.threads(S.pr.number, function(nodes, me, comments)
     if S then
       S.me = me
-      S.convo = M._convo(comments, me)
+      S.convo = M._threads(comments, me)
       S.threads = vim.tbl_filter(function(t)
         return not t.isResolved
       end, nodes)
@@ -1316,7 +1380,8 @@ function M.comment()
   end
   if vim.api.nvim_get_current_buf() == S.convo_buf then
     -- a reply links the comment under the cursor, so the agent knows what you're answering
-    local c = S.convo_rows and S.convo_rows[vim.fn.line('.')]
+    local row = S.convo_rows and S.convo_rows[vim.fn.line('.')]
+    local c = row and row.comment
     local context = c and vim.list_extend({ '@' .. who(c) .. ':' }, vim.split((c.body:gsub('\r', '')), '\n')) or {}
     return input(c and 'Reply on the PR conversation' or 'PR comment', context, function(text)
       local body = table.concat(text, '\n')
@@ -1348,14 +1413,24 @@ end
 -- Resolve the PR thread on this line; in the conversation, hide the comment as resolved.
 function M.resolve()
   if S and vim.api.nvim_get_current_buf() == S.convo_buf then
-    local c = S.convo_rows and S.convo_rows[vim.fn.line('.')]
-    if not c then
+    local row = S.convo_rows and S.convo_rows[vim.fn.line('.')]
+    if not row then
       return vim.notify('overwatch: no comment under the cursor', WARN)
     end
-    return gh.hide(c.id, function()
-      vim.notify('overwatch: hid @' .. who(c) .. "'s comment as resolved")
-      refresh()
-    end)
+    -- the whole chain, so it collapses together on GitHub too
+    local todo = vim.tbl_filter(function(c)
+      return not c.isMinimized
+    end, row.thread.items)
+    local function hide(i)
+      if i > #todo then
+        vim.notify(('overwatch: hid %d comment%s as resolved'):format(#todo, #todo == 1 and '' or 's'))
+        return refresh()
+      end
+      gh.hide(todo[i].id, function()
+        hide(i + 1)
+      end)
+    end
+    return hide(1)
   end
   local _, rel = here()
   if not rel then

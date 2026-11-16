@@ -57,7 +57,14 @@ query($owner:String!, $repo:String!, $pr:Int!) {
 - `subjectType: FILE` threads are file comments. Their lines are in the link that starts the first comment. The code block shows what those lines held, so use it to find the code if it has moved.
 - `isOutdated: true` means the code under the comment has changed since. Still address it, and say in your reply that the line moved.
 
-**Conversation comments** (`comments`): every comment from the reviewer is a work item, except ones hidden as resolved (`isMinimized: true`). A comment is **open** if no later comment of yours replies to it, which you do by linking its `url` (see step 5). A reviewer comment that starts with `Re: <url>` is a follow-up to the comment at that url. Ignore comments from anyone else, such as CI bots.
+**Conversation comments** (`comments`): the conversation is flat on GitHub, so comments form **chains** by what they start with:
+- a first line `Re: <url of an earlier comment>`;
+- or a leading `> quote` of an earlier comment (GitHub's "Quote reply").
+
+A comment with neither starts its own chain. A chain the reviewer took part in is a work item.
+- It's **open** if its last comment isn't yours and it isn't entirely hidden as resolved (`isMinimized: true`).
+- The reviewer's latest comment in the chain is the current ask.
+- Ignore chains with only other people, such as CI bots.
 
 Read each item in full, including every reply. The latest reviewer comment is the current ask.
 
@@ -102,7 +109,7 @@ After pushing, reply to every item.
 gh api -X POST "repos/{owner}/{repo}/pulls/$PR/comments/$COMMENT_ID/replies" -f body="..."
 ```
 
-**Conversation comment.** Post a new PR comment whose first line links the comment you're answering:
+**Conversation comment.** Post a new PR comment whose first line links the **latest** comment in the chain you're answering, which keeps the chain together:
 
 ```bash
 gh pr comment $PR --body "Re: <the comment's url>

@@ -77,7 +77,11 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 5. **Whose turn.** A `●` in the sign column marks each open thread, on the lines it's about (outdated threads sit at their original line). `]r`/`[r` cycle through them in a file. A thread is purple while you had the last word, and yellow once the agent (or anyone else) replies. The tree's `●` counts turn yellow the same way. Verify the fix, then `<leader>rx` resolves the thread. The agent never resolves anything itself.
 
-6. **PR conversation.** Comments on the PR itself, rather than on code, live in the file tree as a `💬 PR conversation ●N` row, which is yellow when someone else spoke last. `<CR>` opens the conversation in the main window. There, `]r`/`[r` move between comments, and `<leader>rc` replies, linking the comment under the cursor so the agent knows what you're answering. `<leader>rx` hides a comment on GitHub as resolved. If a review starts with no code to look at but comments waiting on you, the conversation opens by itself. Files with a thread waiting on you show in the tree even when their code hasn't changed.
+6. **PR conversation.** Comments on the PR itself, rather than on code, live in the file tree as a `💬 PR conversation ●N` row, which is yellow when someone else spoke last in any discussion. GitHub's conversation is flat, so overwatch rebuilds the discussions:
+   - a reply that starts with `Re: <link>` joins the comment it links to (replies from nvim and from agents do this);
+   - so does one made with GitHub's "Quote reply".
+
+   N counts discussions, not comments. `<CR>` opens the conversation in the main window. There, each discussion is one entry, with its replies indented under it. `]r`/`[r` move between discussions. `<leader>rc` replies into the one under the cursor. `<leader>rx` hides the whole discussion on GitHub as resolved. If a review starts with no code to look at but comments waiting on you, the conversation opens by itself. Files with a thread waiting on you show in the tree even when their code hasn't changed.
 
 7. **Hand off.** `<leader>ra` copies the agent prompt. Paste it into any agent.
 
