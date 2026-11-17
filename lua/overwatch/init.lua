@@ -496,8 +496,14 @@ local function buf_rel(buf, root)
   return name:match('^overwatch://deleted/(.+)$') or (root and vim.fs.relpath(root, name))
 end
 
+-- The side-by-side's left pane: the file at its review base, named overwatch://base/<rev>:<path>.
+local function base_name(base, rel)
+  return ('overwatch://base/%s:%s'):format(base:sub(1, 8), rel)
+end
+
 local function is_base_pane(w)
-  return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w)):match('^gitsigns://') ~= nil
+  local name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w))
+  return name:match('^overwatch://base/') ~= nil or name:match('^gitsigns://') ~= nil
 end
 
 -- Close the side-by-side base panes in this tab and turn diff mode off. True if there were any.
@@ -1228,8 +1234,10 @@ function M.pr(n)
   end)
 end
 
--- Full-file side-by-side for the file window, against the file's review base. Says why when nothing
--- can be shown, unless quiet (when it's only following you between files).
+-- Full-file side-by-side for the file window: the file at its review base, read straight from git
+-- into a read-only pane on the left, diffed with Vim's own :diffthis. (Not gitsigns' diffthis: it
+-- builds that pane from a cached base that can lag behind a just-switched one, which showed whole-PR
+-- diffs after <leader>rv.) Says why when it can't, unless quiet (only following you between files).
 local function open_split(quiet)
   local w = file_window()
   if not w then
@@ -1245,36 +1253,48 @@ local function open_split(quiet)
   if vim.bo[buf].buftype ~= '' then
     return why('side-by-side needs a file in the repo, not ' .. vim.api.nvim_buf_get_name(buf))
   end
-  -- gitsigns silently refuses a window still in diff mode, e.g. left over after its base pane closed
-  if vim.wo[w].diff then
-    vim.cmd.diffoff()
+  local root = S and S.root or git('rev-parse', '--show-toplevel')
+  local rel = root and vim.fs.relpath(root, vim.api.nvim_buf_get_name(buf))
+  if not rel then
+    return why("this file isn't in a git repo")
   end
-  local sd = vim.b[buf].gitsigns_status_dict
-  if not (sd and sd.added) then
-    if not S then
-      return why("gitsigns isn't tracking this file")
+  -- in a review, the file's review base; otherwise the index, as gitsigns does
+  local base = S and base_for(rel) or ''
+  local r = vim.system({ 'git', 'show', base .. ':' .. rel }, { cwd = root, text = true }):wait()
+  -- a file that didn't exist at the base gets an empty pane: all of it is new
+  local lines = r.code == 0 and vim.split(r.stdout, '\n', { plain = true }) or {}
+  if lines[#lines] == '' then
+    table.remove(lines)
+  end
+  if vim.bo[buf].fileformat == 'dos' then
+    for i, l in ipairs(lines) do
+      lines[i] = l:gsub('\r$', '')
     end
-    -- just opened, and gitsigns hasn't attached yet: finish when it has (GitSignsUpdate, in setup)
-    S.split_for = { win = w, buf = buf, quiet = quiet }
-    return
   end
-  local rel = S and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(buf))
-  local base = rel and base_for(rel) or nil
-  require('gitsigns').diffthis(base, { vertical = true }, function(err)
-    vim.schedule(function()
-      local shown = false
-      for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-        shown = shown or is_base_pane(win)
-        if vim.wo[win].diff then
-          vim.wo[win].foldenable = false
-        end
-      end
-      if not shown then
-        local at = base and (' at ' .. base:sub(1, 7)) or ''
-        why(('nothing to compare %s against%s%s'):format(rel or 'this file', at, err and (' (' .. tostring(err) .. ')') or ''))
-      end
+  local name = base_name(base ~= '' and base or 'index', rel)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b) == name then
+      pcall(vim.api.nvim_buf_delete, b, { force = true })
+    end
+  end
+  local bbuf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(bbuf, 0, -1, false, lines)
+  vim.bo[bbuf].modifiable = false
+  vim.bo[bbuf].bufhidden = 'wipe'
+  vim.bo[bbuf].filetype = vim.bo[buf].filetype
+  pcall(vim.api.nvim_buf_set_name, bbuf, name)
+  if vim.wo[w].diff then
+    vim.api.nvim_win_call(w, function()
+      vim.cmd.diffoff() -- left over from a pane closed by hand
     end)
-  end)
+  end
+  local bw = vim.api.nvim_open_win(bbuf, false, { split = 'left', win = w })
+  for _, win in ipairs({ bw, w }) do
+    vim.api.nvim_win_call(win, function()
+      vim.cmd.diffthis()
+    end)
+    vim.wo[win].foldenable = false
+  end
 end
 
 -- Toggle side-by-side by what's on screen: base panes showing, close them; otherwise open one. It's
@@ -1302,33 +1322,16 @@ local function follow_split(win, buf)
     return
   end
   local rel = vim.bo[buf].buftype == '' and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(buf))
+  local want = rel and base_name(base_for(rel), rel)
   for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    local name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w))
-    if rel and name:match('^gitsigns://') and name:sub(-#rel - 1) == ':' .. rel then
-      return -- already paired with this file
+    if want and vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w)) == want then
+      return -- already paired with this file at its base
     end
   end
   close_split()
   if rel then
-    -- diffthis needs gitsigns attached, and a file that was just opened isn't yet: finish on its
-    -- first update (see setup)
-    S.split_for = { win = win, buf = buf, quiet = true }
-    local sd = vim.b[buf].gitsigns_status_dict
-    if sd and sd.added then
-      M._resplit(buf)
-    end
-  end
-end
-
-function M._resplit(buf)
-  local want = S and S.split_for
-  if not (want and want.buf == buf) then
-    return
-  end
-  S.split_for = nil
-  if vim.api.nvim_win_is_valid(want.win) and vim.api.nvim_win_get_buf(want.win) == buf then
-    vim.api.nvim_set_current_win(want.win)
-    open_split(want.quiet)
+    vim.api.nvim_set_current_win(win)
+    open_split(true)
   end
 end
 
@@ -1545,15 +1548,8 @@ function M.setup(opts)
     group = g,
     pattern = 'GitSignsUpdate',
     callback = function(a)
-      local buf = a.data and a.data.buffer
-      if buf then
-        apply_base(buf)
-        local sd = vim.b[buf].gitsigns_status_dict
-        if sd and sd.added then
-          vim.schedule(function()
-            M._resplit(buf)
-          end)
-        end
+      if a.data and a.data.buffer then
+        apply_base(a.data.buffer)
       end
     end,
   })
