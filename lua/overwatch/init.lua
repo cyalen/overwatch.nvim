@@ -1167,22 +1167,36 @@ local function open_tree(path, n)
   M.start(nil, n, tab)
 end
 
+-- The PR picker's status mark. Emoji, because vim.ui.select can't colour text.
+--   🟡 needs your review: nobody's decided yet, or there are commits since your last review
+--   ✅ approved
+--   ❌ changes requested
+function M._pr_status(p, me)
+  local mine = M._last_review(p.reviews, me)
+  if mine and mine.commit.oid ~= p.headRefOid then
+    return '🟡'
+  end
+  return p.reviewDecision == 'APPROVED' and '✅' or p.reviewDecision == 'CHANGES_REQUESTED' and '❌' or '🟡'
+end
+
 -- Review PR n without touching this checkout: use the worktree that already has its branch
 -- (e.g. the agent's), else check it out into a fresh one. No n: pick from open PRs.
 function M.pr(n)
   if not n then
     return gh.list(function(prs)
-      vim.ui.select(prs, {
-        prompt = 'Review PR',
-        format_item = function(p)
-          return ('#%d %s  (%s, @%s)'):format(p.number, p.title, p.headRefName, p.author.login)
-        end,
-      }, function(p)
-        if p then
-          vim.schedule(function()
-            M.pr(p.number)
-          end)
-        end
+      gh.me(function(me)
+        vim.ui.select(prs, {
+          prompt = 'Review PR  (🟡 needs review · ✅ approved · ❌ changes requested)',
+          format_item = function(p)
+            return ('%s #%d %s  (%s, @%s)'):format(M._pr_status(p, me), p.number, p.title, p.headRefName, p.author.login)
+          end,
+        }, function(p)
+          if p then
+            vim.schedule(function()
+              M.pr(p.number)
+            end)
+          end
+        end)
       end)
     end)
   end

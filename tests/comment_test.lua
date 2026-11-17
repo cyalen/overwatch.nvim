@@ -60,4 +60,13 @@ assert(ow._utc_epoch('1970-01-01T00:00:00Z') == 0)
 assert(ow._utc_epoch('2026-11-13T16:02:24Z') == 1794585744, tostring(ow._utc_epoch('2026-11-13T16:02:24Z')))
 assert(ow._utc_epoch('2024-02-29T12:00:00Z') == 1709208000, 'leap day')
 
+-- PR picker status
+local function review(state, oid, at) return { author = { login = 'me' }, state = state, commit = { oid = oid }, body = '', submittedAt = at or '2026-01-01T00:00:00Z' } end
+assert(ow._pr_status({ reviewDecision = 'REVIEW_REQUIRED', headRefOid = 'h', reviews = {} }, 'me') == '🟡', 'never reviewed')
+assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = { review('APPROVED', 'h') } }, 'me') == '✅', 'approved at head')
+assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h', reviews = { review('CHANGES_REQUESTED', 'h') } }, 'me') == '❌', 'changes requested at head')
+assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h2', reviews = { review('CHANGES_REQUESTED', 'h1') } }, 'me') == '🟡', 'agent pushed since you requested changes')
+assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = {} }, 'me') == '✅', 'approved by someone else')
+assert(ow._pr_status({ reviewDecision = '', headRefOid = 'h', reviews = {} }, 'me') == '🟡', 'no review rules on the repo')
+
 print('ok')

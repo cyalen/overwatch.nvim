@@ -45,7 +45,7 @@ function M.me(cb)
 end
 
 function M.list(cb)
-  run({ 'pr', 'list', '--limit', '50', '--json', 'number,title,headRefName,author' }, cb)
+  run({ 'pr', 'list', '--limit', '50', '--json', 'number,title,headRefName,author,reviewDecision,headRefOid,reviews' }, cb)
 end
 
 local THREADS = [[
