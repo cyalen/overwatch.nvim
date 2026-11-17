@@ -29,4 +29,47 @@ assert(select(1, ow._comment_lines('**L12:** one line')) == 12)
 -- a normal comment has no lines and keeps its text
 assert(ow._comment_lines('just a comment') == nil and ow._comment_text('just a comment') == 'just a comment')
 
+-- PR conversation chains: `Re: <url>` and quote replies join the comment they answer
+local function c(id, who, at, body, hidden)
+  return { id = 'C' .. id, url = 'https://github.com/o/r/pull/1#issuecomment-' .. id, author = { login = who }, createdAt = at, body = body, isMinimized = hidden or false }
+end
+local chains = ow._threads({
+  c(1, 'agent', '2026-01-01', 'Rebased onto main and force-pushed.'),
+  c(2, 'me', '2026-01-02', 'Re: https://github.com/o/r/pull/1#issuecomment-1\n\nwhy rebase?'),
+  c(3, 'agent', '2026-01-03', 'Re: https://github.com/o/r/pull/1#issuecomment-2\n\nmain moved'), -- reply to a reply
+  c(4, 'agent', '2026-01-04', 'Unrelated: CI is green.'),
+  c(5, 'me', '2026-01-05', '> Unrelated: CI is green.\n\nnice'), -- GitHub Quote reply
+  c(6, 'agent', '2026-01-06', 'Re: https://example.invalid/whatever#issuecomment-4\nsame chain, other url'),
+}, 'me')
+assert(#chains == 2, 'two chains, got ' .. #chains)
+assert(chains[1].root.id == 'C1' and #chains[1].items == 3, 'Re: chain incl. reply to a reply')
+assert(chains[1].waiting, 'agent spoke last in chain 1')
+assert(chains[2].root.id == 'C4' and #chains[2].items == 3, 'quote reply and issuecomment-id match join chain 2')
+assert(chains[2].waiting, 'agent spoke last in chain 2')
+assert(ow._threads({ c(1, 'agent', '2026-01-01', 'a'), c(2, 'me', '2026-01-02', 'Re: x#issuecomment-1') }, 'me')[1].waiting == false, 'my last word: not waiting')
+-- hidden: a fully hidden chain drops out; a new reply brings it back
+assert(#ow._threads({ c(1, 'agent', '2026-01-01', 'a', true), c(2, 'me', '2026-01-02', 'Re: x#issuecomment-1', true) }, 'me') == 0, 'fully hidden chain dropped')
+chains = ow._threads({ c(1, 'agent', '2026-01-01', 'a', true), c(2, 'agent', '2026-01-03', 'Re: x#issuecomment-1\nmore') }, 'me')
+assert(#chains == 1 and #chains[1].items == 2 and chains[1].waiting, 'reply to a resolved chain reopens it')
+-- unlinked comments are their own chains
+assert(#ow._threads({ c(1, 'agent', '2026-01-01', 'a'), c(2, 'agent', '2026-01-02', 'b') }, 'me') == 2, 'unlinked: separate chains')
+
+-- review times: ISO (UTC) -> seconds since the epoch
+assert(ow._utc_epoch('1970-01-02T00:00:00Z') == 86400, tostring(ow._utc_epoch('1970-01-02T00:00:00Z')))
+assert(ow._utc_epoch('1970-01-01T00:00:00Z') == 0)
+assert(ow._utc_epoch('2026-11-13T16:02:24Z') == 1794585744, tostring(ow._utc_epoch('2026-11-13T16:02:24Z')))
+assert(ow._utc_epoch('2024-02-29T12:00:00Z') == 1709208000, 'leap day')
+
+-- PR picker status
+local function review(state, oid, at) return { author = { login = 'me' }, state = state, commit = { oid = oid }, body = '', submittedAt = at or '2026-01-01T00:00:00Z' } end
+assert(ow._pr_status({ reviewDecision = 'REVIEW_REQUIRED', headRefOid = 'h', reviews = {} }, 'me') == 'review', 'never reviewed')
+assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = { review('APPROVED', 'h') } }, 'me') == 'approved', 'approved at head')
+assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h', reviews = { review('CHANGES_REQUESTED', 'h') } }, 'me') == 'changes', 'changes requested at head')
+assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h2', reviews = { review('CHANGES_REQUESTED', 'h1') } }, 'me') == 'review', 'agent pushed since you requested changes')
+assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = {} }, 'me') == 'approved', 'approved by someone else')
+assert(ow._pr_status({ reviewDecision = '', headRefOid = 'h', reviews = {} }, 'me') == 'review', 'no review rules on the repo')
+
+local line, hls = ow._pr_line({ number = 7, title = 'T', headRefName = 'b', author = { login = 'x' }, reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h', reviews = {} }, 'me')
+assert(line == '✗ #7 T  (b, @x)' and hls[1][2] == 'DiagnosticError' and hls[1][1][2] == #'✗', line)
+
 print('ok')

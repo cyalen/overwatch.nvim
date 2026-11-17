@@ -1,9 +1,13 @@
 -- Thin async wrappers around the `gh` CLI. Everything runs as the reviewer's own gh auth.
 local M = {}
 
+-- The repo under review. Set while a review is active, so gh never depends on Neovim's current
+-- directory (which follows the current tab).
+M.cwd = nil
+
 -- cb gets decoded JSON (or raw stdout when it isn't JSON). on_err gets stderr; without it we notify.
 local function run(args, cb, on_err)
-  vim.system(vim.list_extend({ 'gh' }, args), { text = true }, function(r)
+  vim.system(vim.list_extend({ 'gh' }, args), { text = true, cwd = M.cwd }, function(r)
     vim.schedule(function()
       if r.code ~= 0 then
         if on_err then
@@ -21,7 +25,7 @@ end
 
 -- n: PR number, or nil for the current branch's PR. cb(nil) when there is none.
 function M.pr(n, cb)
-  local args = { 'pr', 'view', '--json', 'number,headRefName,headRefOid,baseRefName,url' }
+  local args = { 'pr', 'view', '--json', 'number,headRefName,headRefOid,baseRefName,url,reviews' }
   if n then
     table.insert(args, 3, tostring(n))
   end
@@ -30,8 +34,22 @@ function M.pr(n, cb)
   end)
 end
 
+-- Your GitHub login (cached). cb(nil) if gh can't say.
+local me
+function M.me(cb)
+  if me then
+    return cb(me)
+  end
+  run({ 'api', 'user', '--jq', '.login' }, function(login)
+    me = vim.trim(tostring(login))
+    cb(me)
+  end, function()
+    cb(nil)
+  end)
+end
+
 function M.list(cb)
-  run({ 'pr', 'list', '--limit', '50', '--json', 'number,title,headRefName,author' }, cb)
+  run({ 'pr', 'list', '--limit', '50', '--json', 'number,title,headRefName,author,reviewDecision,headRefOid,reviews' }, cb)
 end
 
 local THREADS = [[
@@ -45,15 +63,28 @@ query($owner:String!, $repo:String!, $pr:Int!) {
           comments(first:50) { nodes { databaseId author { login } body } }
         }
       }
+      comments(last:100) { nodes { id url author { login } body createdAt isMinimized } }
     }
   }
 }]]
 
--- cb(threads, your login). ponytail: first 100 threads only, paginate if a PR ever has more
+-- cb(review threads, your login, PR conversation comments).
+-- ponytail: first 100 threads / last 100 comments only, paginate if a PR ever has more
 function M.threads(pr, cb)
   run({ 'api', 'graphql', '-F', 'owner={owner}', '-F', 'repo={repo}', '-F', 'pr=' .. pr, '-f', 'query=' .. THREADS }, function(d)
-    cb(d.data.repository.pullRequest.reviewThreads.nodes, d.data.viewer.login)
+    local p = d.data.repository.pullRequest
+    cb(p.reviewThreads.nodes, d.data.viewer.login, p.comments.nodes)
   end)
+end
+
+-- A comment in the PR's main conversation.
+function M.pr_comment(n, body, cb)
+  run({ 'api', ('repos/{owner}/{repo}/issues/%d/comments'):format(n), '-f', 'body=' .. body }, cb)
+end
+
+-- Hide a conversation comment as Resolved (GitHub's way of resolving one).
+function M.hide(id, cb)
+  run({ 'api', 'graphql', '-f', 'id=' .. id, '-f', 'query=mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:RESOLVED}){minimizedComment{isMinimized}}}' }, cb)
 end
 
 -- Body of a file comment standing in for a line comment GitHub won't take (lines outside the
@@ -93,7 +124,7 @@ function M.comment(pr, c, cb)
       if not err2:find('422') then
         return failed(err2)
       end
-      run({ 'api', ('repos/{owner}/{repo}/issues/%d/comments'):format(pr.number), '-f', 'body=' .. body }, function(d)
+      M.pr_comment(pr.number, body, function(d)
         vim.notify(('overwatch: %s isn\'t part of the PR, so that went to the PR conversation'):format(c.path))
         if cb then
           cb(d)

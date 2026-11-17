@@ -14,7 +14,8 @@ local PROMPT = 'Address the review feedback for this branch by following .overwa
 local SEP = '── reply ──'
 local SNIPPET_MAX = 20
 
-local S -- active review: { root, base, pr?, threads, seen_file, tab?, ... }
+local S -- active review: { root, base, pr?, threads, convo, seen_file, tab?, ... }
+local convo_render -- the PR conversation buffer's renderer, defined with it below
 
 -- Runs in the reviewed tree while a review is active, so switching tabs doesn't matter.
 local function git(...)
@@ -73,6 +74,9 @@ local function render(buf)
   if not vim.api.nvim_buf_is_valid(buf) then
     return
   end
+  if S and buf == S.convo_buf then
+    return convo_render()
+  end
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   local rel = S and vim.bo[buf].buftype == '' and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(buf))
   if not rel then
@@ -108,15 +112,38 @@ end
 -- (new commits, a rebase, uncommitted agent edits) it comes back, diffed against the snapshot.
 ---------------------------------------------------------------------------
 
+-- Ticks: path -> snapshot commit, and path -> when you ticked it (seconds since the epoch; nil for
+-- ticks saved before times were recorded). Lines are "<commit> @<time> <path>" or "<commit> <path>".
 local function read_seen()
-  local seen = {}
+  local seen, at = {}, {}
   for _, l in ipairs(read(S.seen_file)) do
-    local c, p = l:match('^(%S+) (.+)$')
+    local c, t, p = l:match('^(%S+) @(%d+) (.+)$')
+    if not c then
+      c, p = l:match('^(%S+) (.+)$')
+    end
     if p then
-      seen[p] = c
+      seen[p], at[p] = c, tonumber(t)
     end
   end
-  return seen
+  return seen, at
+end
+
+-- '2026-11-13T16:02:24Z' -> seconds since the epoch, by plain calendar arithmetic (days from the
+-- civil date), so no time zone or daylight-saving rule gets involved.
+function M._utc_epoch(iso)
+  local y, m, d, hh, mm, ss = (iso or ''):match('(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)')
+  if not y then
+    return nil
+  end
+  y, m, d = tonumber(y), tonumber(m), tonumber(d)
+  if m <= 2 then
+    y = y - 1
+  end
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * ((m + 9) % 12) + 2) / 5) + d - 1
+  local days = era * 146097 + yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy - 719468
+  return days * 86400 + tonumber(hh) * 3600 + tonumber(mm) * 60 + tonumber(ss)
 end
 
 -- A commit holding the working tree as it is right now (HEAD when clean). Touches nothing.
@@ -129,14 +156,21 @@ end
 -- Unticking puts a file back how it was when this review opened (S.seen0), so undoing a misclick
 -- on a file from an earlier review restores that review's tick instead of forgetting it.
 local function set_seen(paths, on)
-  local seen, snap = read_seen(), on and snapshot() or nil
+  local seen, at = read_seen()
+  local snap, now = on and snapshot() or nil, os.time()
   for _, p in ipairs(paths) do
     local before = S.seen0[p]
-    seen[p] = on and snap or (before ~= seen[p] and before or nil)
+    if on then
+      seen[p], at[p] = snap, now
+    elseif before ~= seen[p] then
+      seen[p], at[p] = before, S.seen0_at[p]
+    else
+      seen[p], at[p] = nil, nil
+    end
   end
   local out = {}
   for p, c in pairs(seen) do
-    out[#out + 1] = c .. ' ' .. p
+    out[#out + 1] = at[p] and ('%s @%d %s'):format(c, at[p], p) or (c .. ' ' .. p)
   end
   table.sort(out)
   vim.fn.writefile(out, S.seen_file)
@@ -196,16 +230,54 @@ local function apply_base(buf)
   end
 end
 
+-- Your latest submitted review on the PR. The empty COMMENTED reviews GitHub creates behind each
+-- single comment don't count: one comment mid-review isn't having reviewed the PR.
+function M._last_review(reviews, me)
+  local pick
+  for _, r in ipairs(reviews or {}) do
+    local submitted = r.state == 'APPROVED'
+      or r.state == 'CHANGES_REQUESTED'
+      or r.state == 'DISMISSED'
+      or r.state == 'COMMENTED' and (r.body or '') ~= ''
+    if submitted and r.author and r.author.login == me and r.commit and (not pick or r.submittedAt > pick.submittedAt) then
+      pick = r
+    end
+  end
+  return pick
+end
+
 -- Every file the PR changes, each with a tick state:
 --   ' '  not ticked
 --   '~'  ticked, but changed since
 --   'x'  ticked and unchanged
+-- Your last submitted GitHub review (S.reviewed) counts as a tick on every file, unless a local tick
+-- is newer.
 -- "Since last review" is measured from the ticks as they were when this review opened (S.seen0):
 -- a file changed since then gets that snapshot as its diff base (`since`) and counts only what's
 -- new. Ticking during the review changes the tick, never the diff you're looking at.
 -- Refreshes S.bases, grows S.shown, and re-points open buffers to match.
 local function review_files()
-  local seen, cache, files = read_seen(), {}, numstat(S.base) or {}
+  local seen, seen_at = read_seen()
+  local cache, newer, files = {}, {}, numstat(S.base) or {}
+  local waiting = {}
+  for _, t in ipairs(S.threads) do
+    waiting[t.path] = waiting[t.path] or t.waiting
+  end
+  -- the newer of a local tick and your GitHub review: by history when the review's commit is still
+  -- an ancestor, else (after a rebase / force-push) by when you ticked vs when you submitted the review
+  -- ponytail: a local tick older than that review loses to it, as on GitHub
+  local function baseline(snap, at)
+    local r = S.reviewed
+    if not (r and snap) then
+      return snap or r
+    end
+    local key = snap .. (at or '')
+    if newer[key] == nil then
+      local when = at or tonumber(git('show', '-s', '--format=%ct', snap) or '')
+      newer[key] = git('merge-base', '--is-ancestor', r, snap) ~= nil or (when or 0) > (S.reviewed_at or math.huge)
+    end
+    return newer[key] and snap or r
+  end
   -- snapshot -> { path -> numstat } of what changed since it; false if the snapshot is gone
   -- (gc'd, or an older .seen format), which counts as never ticked
   local function since(snap)
@@ -224,9 +296,10 @@ local function review_files()
   S.bases = {}
   for _, f in ipairs(files) do
     f.deleted = not vim.uv.fs_stat(S.root .. '/' .. f.path)
-    local d = seen[f.path] and since(seen[f.path])
+    local b = baseline(seen[f.path], seen_at[f.path])
+    local d = b and since(b)
     f.state = not d and ' ' or d[f.path] and '~' or 'x'
-    local s0 = S.seen0[f.path]
+    local s0 = baseline(S.seen0[f.path], S.seen0_at[f.path])
     local d0 = s0 and since(s0)
     if d0 and d0[f.path] then
       f.since = s0
@@ -236,8 +309,9 @@ local function review_files()
       end
     end
     -- the "since" tree: whatever needed review when you opened it, plus anything that changes
-    -- while you're in it. Ticking doesn't remove a file, so you can see (and undo) what you ticked.
-    if f.state ~= 'x' then
+    -- while you're in it, plus files with a thread waiting on you. Ticking doesn't remove a file,
+    -- so you can see (and undo) what you ticked.
+    if f.state ~= 'x' or waiting[f.path] then
       S.shown[f.path] = true
     end
   end
@@ -331,6 +405,13 @@ function M._fold(lnum)
   return S and S.nav_folds and S.nav_folds[lnum] or 0
 end
 
+function M._since_label()
+  if S.all then
+    return 'all changes'
+  end
+  return S.reviewed and ('since your review of ' .. S.reviewed:sub(1, 7)) or 'since last review'
+end
+
 local function nav_render()
   if not (S and S.nav and vim.api.nvim_buf_is_valid(S.nav) and nav_win()) then
     return
@@ -351,10 +432,22 @@ local function nav_render()
   local status = S.all and ('%d to review · all %d files · a: since'):format(queued, #files)
     or ('%d to review · %d unchanged hidden · a: all'):format(queued, #files - #shown)
   local rows = {
-    { line = { { what .. (S.all and ' · all changes' or ' · since last review'), 'Title' } } },
+    { line = { { what .. ' · ' .. M._since_label(), 'Title' } } },
     { line = { { status, 'Comment' } } },
   }
-  S.nav_folds = { 0, 0 }
+  if S.convo and #S.convo > 0 then
+    local waiting = #vim.tbl_filter(function(c)
+      return c.waiting
+    end, S.convo)
+    rows[#rows + 1] = {
+      convo = true,
+      line = { { '💬 PR conversation' }, { ' ●' .. #S.convo, waiting > 0 and 'DiagnosticWarn' or 'DiagnosticHint' } },
+    }
+  end
+  S.nav_folds = {}
+  for i = 1, #rows do
+    S.nav_folds[i] = 0
+  end
   for _, r in ipairs(tree_rows(shown)) do
     local pad = string.rep('  ', r.depth)
     if r.dir then
@@ -403,8 +496,14 @@ local function buf_rel(buf, root)
   return name:match('^overwatch://deleted/(.+)$') or (root and vim.fs.relpath(root, name))
 end
 
+-- The side-by-side's left pane: the file at its review base, named overwatch://base/<rev>:<path>.
+local function base_name(base, rel)
+  return ('overwatch://base/%s:%s'):format(base:sub(1, 8), rel)
+end
+
 local function is_base_pane(w)
-  return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w)):match('^gitsigns://') ~= nil
+  local name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w))
+  return name:match('^overwatch://base/') ~= nil or name:match('^gitsigns://') ~= nil
 end
 
 -- Close the side-by-side base panes in this tab and turn diff mode off. True if there were any.
@@ -427,11 +526,17 @@ local function close_split()
 end
 
 -- Where files open: the current window if it's an ordinary one, else the side-by-side file pane,
--- the window you came from, or the first ordinary window. Never the file tree or a base pane.
+-- the window you came from, or the first ordinary window. Never the file tree, a base pane or the
+-- goto pane.
 local function file_window()
   local nav = nav_win()
   local function ok(w)
-    return w ~= 0 and w ~= nav and vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_config(w).relative == '' and not is_base_pane(w)
+    return w ~= 0
+      and w ~= nav
+      and w ~= (S and S.goto_win)
+      and vim.api.nvim_win_is_valid(w)
+      and vim.api.nvim_win_get_config(w).relative == ''
+      and not is_base_pane(w)
   end
   local wins, cur = vim.api.nvim_tabpage_list_wins(0), vim.api.nvim_get_current_win()
   if ok(cur) then
@@ -503,6 +608,177 @@ local function open_file(f)
   })
 end
 
+---------------------------------------------------------------------------
+-- PR conversation: comments on the PR itself rather than on code. In the tree it's a row; <CR> opens
+-- it in the main window, where <leader>rc replies, <leader>rx hides a comment as resolved and
+-- ]r / [r move between comments.
+---------------------------------------------------------------------------
+
+-- The PR conversation as chains. GitHub's conversation is flat, so chains are rebuilt from the
+-- comments themselves: a reply starts with `Re: <url>` (replies from nvim and agents), or quotes an
+-- earlier comment (GitHub's Quote reply); anything else starts its own chain. Each chain is
+-- { root, items (date order), waiting = the last word isn't yours }. Chains whose comments are all
+-- hidden as resolved are dropped; a new reply to one brings it back.
+local function norm(text)
+  return vim.trim((text or ''):gsub('\r', ''):gsub('%s+', ' '))
+end
+
+function M._threads(comments, me)
+  local all, by_id, parent = {}, {}, {}
+  for _, c in ipairs(comments or {}) do
+    all[#all + 1] = c
+    local id = (c.url or ''):match('issuecomment%-(%d+)')
+    if id then
+      by_id[id] = c
+    end
+  end
+  table.sort(all, function(a, b)
+    return a.createdAt < b.createdAt
+  end)
+  for i, c in ipairs(all) do
+    local body = (c.body or ''):gsub('\r', '')
+    local id = body:match('^%s*Re:%s*%S-issuecomment%-(%d+)')
+    local p = id and by_id[id]
+    if not p then
+      local quote = {}
+      for l in vim.gsplit(body, '\n') do
+        local q = l:match('^>%s?(.*)$')
+        if not q then
+          break
+        end
+        quote[#quote + 1] = q
+      end
+      local q = norm(table.concat(quote, ' '))
+      for j = i - 1, 1, -1 do
+        if q ~= '' and norm(all[j].body):find(q, 1, true) then
+          p = all[j]
+          break
+        end
+      end
+    end
+    parent[c] = p ~= c and p or nil
+  end
+  local chains, of = {}, {}
+  for _, c in ipairs(all) do
+    local r, seen = c, {}
+    while parent[r] and not seen[r] do
+      seen[r] = true
+      r = parent[r]
+    end
+    if not of[r] then
+      of[r] = { root = r, items = {} }
+      chains[#chains + 1] = of[r]
+    end
+    table.insert(of[r].items, c)
+  end
+  return vim.tbl_filter(function(t)
+    local last = t.items[#t.items]
+    t.waiting = not (last.author and last.author.login == me)
+    for _, c in ipairs(t.items) do
+      if not c.isMinimized then
+        return true
+      end
+    end
+    return false
+  end, chains)
+end
+
+local function who(c)
+  return c.author and c.author.login or 'ghost'
+end
+
+-- One entry per chain: the first comment, then its replies indented under it (their `Re:` line
+-- dropped, the indent says it). One sign per chain, on its first line, so ]r / [r go chain to chain.
+convo_render = function()
+  local buf = S and S.convo_buf
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return
+  end
+  local lines, rows, heads, headers = {}, {}, {}, {}
+  for _, t in ipairs(S.convo or {}) do
+    for k, c in ipairs(t.items) do
+      local row = { comment = c, thread = t }
+      local when = (c.createdAt:gsub('T', ' ')):sub(1, 16)
+      lines[#lines + 1] = ('%s@%s · %s%s'):format(k > 1 and '  ↳ ' or '', who(c), when, c.isMinimized and ' · resolved' or '')
+      rows[#lines], headers[#lines] = row, c
+      if k == 1 then
+        heads[#heads + 1] = { #lines, t }
+      end
+      local body = (c.body or ''):gsub('\r', '')
+      if k > 1 then
+        body = body:gsub('^%s*Re:%s*%S+[ \t]*\n?[ \t]*\n?', '')
+      end
+      for _, l in ipairs(vim.split(body, '\n')) do
+        lines[#lines + 1] = (k > 1 and '    ' or '') .. l
+        rows[#lines] = row
+      end
+    end
+    lines[#lines + 1] = ''
+  end
+  if #lines == 0 then
+    lines = { 'No PR-level comments.' }
+  end
+  S.convo_rows, S.convo_heads = rows, heads
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  -- header highlights live apart from `ns`, whose marks are what ]r / [r stop on (one per chain)
+  local hl = vim.api.nvim_create_namespace('overwatch_convo')
+  vim.api.nvim_buf_clear_namespace(buf, hl, 0, -1)
+  for lnum, c in pairs(headers) do
+    vim.api.nvim_buf_set_extmark(buf, hl, lnum - 1, 0, { end_col = #lines[lnum], hl_group = c.isMinimized and 'Comment' or 'Title' })
+  end
+  for _, h in ipairs(heads) do
+    vim.api.nvim_buf_set_extmark(buf, ns, h[1] - 1, 0, {
+      sign_text = '●',
+      sign_hl_group = h[2].waiting and 'DiagnosticWarn' or 'DiagnosticHint',
+    })
+  end
+end
+
+-- Open the conversation in the main window, on the first chain waiting on you (else the last).
+local function open_convo()
+  if not (S.convo_buf and vim.api.nvim_buf_is_valid(S.convo_buf)) then
+    S.convo_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[S.convo_buf].filetype = 'markdown'
+    pcall(vim.api.nvim_buf_set_name, S.convo_buf, 'overwatch://conversation')
+  end
+  local target = file_window()
+  if not target then
+    vim.cmd('rightbelow vnew')
+    target = vim.api.nvim_get_current_win()
+  end
+  vim.api.nvim_set_current_win(target)
+  vim.api.nvim_win_set_buf(target, S.convo_buf)
+  convo_render()
+  local land
+  for _, h in ipairs(S.convo_heads) do
+    land = land or (h[2].waiting and h[1])
+  end
+  land = land or (S.convo_heads[#S.convo_heads] or { 1 })[1]
+  vim.api.nvim_win_set_cursor(target, { land, 0 })
+end
+
+-- Once, on start: with no code to review but PR comments waiting on you, open the conversation.
+-- Runs when both the quickfix (S.empty) and the chains (S.convo) are known, whichever is last.
+local function maybe_open_convo()
+  if not (S and S.convo and S.empty ~= nil) or S.convo_checked then
+    return
+  end
+  S.convo_checked = true
+  local n = #vim.tbl_filter(function(c)
+    return c.waiting
+  end, S.convo)
+  if n == 0 then
+    return
+  end
+  if S.empty then
+    open_convo()
+  end
+  vim.notify(('overwatch: %d PR-level discussion%s waiting on you%s'):format(n, n == 1 and '' or 's', S.empty and '' or ' (💬 in the file tree)'))
+end
+
 function M.files()
   if not S then
     return vim.notify('overwatch: start a review first', WARN)
@@ -522,7 +798,9 @@ function M.files()
     end
     map('<CR>', function()
       local r = under_cursor()
-      if r and r.file then
+      if r and r.convo then
+        open_convo()
+      elseif r and r.file then
         open_file(r.file)
       elseif r and r.dir then
         vim.cmd('normal! za')
@@ -566,7 +844,8 @@ function M.files()
     foldtext = '',
     foldlevel = 99,
     foldcolumn = '1',
-    fillchars = 'fold: ,foldopen:▾,foldclose:▸,foldsep: ,eob: ',
+    -- foldinner: no nesting-level digits in the fold column for nested directories
+    fillchars = 'fold: ,foldopen:▾,foldclose:▸,foldsep: ,foldinner: ,eob: ',
   }
   for k, v in pairs(wo) do
     vim.wo[win][k] = v
@@ -627,9 +906,10 @@ local function refresh()
   if not (S and S.pr) then
     return render_all()
   end
-  gh.threads(S.pr.number, function(nodes, me)
+  gh.threads(S.pr.number, function(nodes, me, comments)
     if S then
       S.me = me
+      S.convo = M._threads(comments, me)
       S.threads = vim.tbl_filter(function(t)
         return not t.isResolved
       end, nodes)
@@ -648,6 +928,7 @@ local function refresh()
         t.waiting = not (last and last.author and last.author.login == me)
       end
       render_all()
+      maybe_open_convo()
     end
   end)
 end
@@ -761,44 +1042,74 @@ function M.start(base, n, tab)
     return vim.notify('overwatch: not in a git repo', ERROR)
   end
   gh.pr(n, function(pr)
-    if not base then
-      local ref = pr and ('origin/' .. pr.baseRefName) or git('rev-parse', '--abbrev-ref', 'origin/HEAD')
-      base = ref and git('merge-base', 'HEAD', ref)
-      if not base then
-        return vim.notify('overwatch: no base found, pass one: :Overwatch <rev>', ERROR)
-      end
-    end
-    local file = seen_file(root)
-    S = { root = root, base = base, pr = pr, threads = {}, seen_file = file, tab = tab, bases = {}, shown = {}, all = not M.opts.since_last_review }
-    ensure(root, file)
-    S.seen0 = read_seen()
-
-    local gs = require('gitsigns')
-    gs.change_base(base, true, function()
-      vim.schedule(function()
-        if not S then
-          return
-        end
-        gs.toggle_linehl(true)
-        gs.toggle_word_diff(true)
-        for _, b in ipairs(vim.api.nvim_list_bufs()) do
-          vim.b[b].overwatch_base = nil -- the global change just put every buffer on `base`
-        end
-        local files = review_files()
-        local qf = set_qf(files)
-        if n and #qf > 0 then
-          vim.cmd.cfirst()
-        end
-        local todo = #vim.tbl_filter(to_review, files)
-        local what = pr and ('PR #' .. pr.number) or 'no PR'
-        vim.notify(('overwatch: %s · %d of %d files to review, %d hunks (%s)'):format(what, todo, #files, #qf, S.all and 'all changes' or 'since last review'))
-      end)
+    gh.me(function(me)
+      M._begin(root, base, n, tab, pr, me)
     end)
-    if pr and git('rev-parse', 'HEAD') ~= pr.headRefOid then
-      vim.notify('overwatch: local HEAD is not the PR head; comments may land on the wrong lines', WARN)
-    end
-    refresh()
   end)
+end
+
+function M._begin(root, base, n, tab, pr, me)
+  if not base then
+    local ref = pr and ('origin/' .. pr.baseRefName) or git('rev-parse', '--abbrev-ref', 'origin/HEAD')
+    base = ref and git('merge-base', 'HEAD', ref)
+    if not base then
+      return vim.notify('overwatch: no base found, pass one: :Overwatch <rev>', ERROR)
+    end
+  end
+  gh.cwd = root
+  local file = seen_file(root)
+  local rv = pr and me and M._last_review(pr.reviews, me)
+  local reviewed = rv and rv.commit.oid
+  if reviewed and not git('cat-file', '-e', reviewed .. '^{commit}') then
+    git('fetch', '-q', 'origin', reviewed)
+    if not git('cat-file', '-e', reviewed .. '^{commit}') then
+      vim.notify(('overwatch: your last review was on %s, which isn\'t available locally; using your local ticks only'):format(reviewed:sub(1, 8)), WARN)
+      reviewed = nil
+    end
+  end
+  S = {
+    root = root,
+    base = base,
+    pr = pr,
+    reviewed = reviewed,
+    reviewed_at = reviewed and M._utc_epoch(rv.submittedAt),
+    threads = {},
+    seen_file = file,
+    tab = tab,
+    bases = {},
+    shown = {},
+    all = not M.opts.since_last_review,
+  }
+  ensure(root, file)
+  S.seen0, S.seen0_at = read_seen()
+
+  local gs = require('gitsigns')
+  gs.change_base(base, true, function()
+    vim.schedule(function()
+      if not S then
+        return
+      end
+      gs.toggle_linehl(true)
+      gs.toggle_word_diff(true)
+      for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        vim.b[b].overwatch_base = nil -- the global change just put every buffer on `base`
+      end
+      local files = review_files()
+      local qf = set_qf(files)
+      S.empty = #qf == 0
+      if n and #qf > 0 then
+        vim.cmd.cfirst()
+      end
+      local todo = #vim.tbl_filter(to_review, files)
+      local what = pr and ('PR #' .. pr.number) or 'no PR'
+      vim.notify(('overwatch: %s · %d of %d files to review, %d hunks (%s)'):format(what, todo, #files, #qf, M._since_label()))
+      maybe_open_convo()
+    end)
+  end)
+  if pr and git('rev-parse', 'HEAD') ~= pr.headRefOid then
+    vim.notify('overwatch: local HEAD is not the PR head; comments may land on the wrong lines', WARN)
+  end
+  refresh()
 end
 
 function M.stop()
@@ -806,8 +1117,9 @@ function M.stop()
   gs.reset_base(true)
   gs.toggle_linehl(false)
   gs.toggle_word_diff(false)
-  local tab, nav = S and S.tab, S and S.nav
+  local tab, nav, convo = S and S.tab, S and S.nav, S and S.convo_buf
   S = nil
+  gh.cwd = nil
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     vim.b[b].overwatch_base = nil
   end
@@ -817,6 +1129,9 @@ function M.stop()
       pcall(vim.api.nvim_win_close, w, true)
     end
     pcall(vim.api.nvim_buf_delete, nav, { force = true })
+  end
+  if convo and vim.api.nvim_buf_is_valid(convo) then
+    pcall(vim.api.nvim_buf_delete, convo, { force = true })
   end
   if tab and vim.api.nvim_tabpage_is_valid(tab) and #vim.api.nvim_list_tabpages() > 1 then
     pcall(vim.cmd.tabclose, vim.api.nvim_tabpage_get_number(tab))
@@ -860,22 +1175,92 @@ local function open_tree(path, n)
   M.start(nil, n, tab)
 end
 
+-- A PR's review status for the picker:
+--   'review'   needs your review: nobody's decided yet, or there are commits since your last review
+--   'approved' approved
+--   'changes'  changes requested
+function M._pr_status(p, me)
+  local mine = M._last_review(p.reviews, me)
+  if mine and mine.commit.oid ~= p.headRefOid then
+    return 'review'
+  end
+  return p.reviewDecision == 'APPROVED' and 'approved' or p.reviewDecision == 'CHANGES_REQUESTED' and 'changes' or 'review'
+end
+
+-- The same marks and theme colours as the file tree.
+local PR_MARKS = {
+  review = { '●', 'DiagnosticWarn' },
+  approved = { '✓', 'DiagnosticOk' },
+  changes = { '✗', 'DiagnosticError' },
+}
+local PR_LEGEND = '● needs review · ✓ approved · ✗ changes requested'
+
+-- One picker line: the text, and the mark's byte range + highlight.
+function M._pr_line(p, me)
+  local mark, hl = unpack(PR_MARKS[M._pr_status(p, me)])
+  local text = ('%s #%d %s  (%s, @%s)'):format(mark, p.number, p.title, p.headRefName, p.author.login)
+  return text, { { { 0, #mark }, hl } }
+end
+
+-- Pick a PR. With telescope, the marks are coloured from your theme; otherwise plain vim.ui.select.
+local function pick_pr(prs, me, choose)
+  local ok, pickers = pcall(require, 'telescope.pickers')
+  if not ok then
+    return vim.ui.select(prs, {
+      prompt = 'Review PR  (' .. PR_LEGEND .. ')',
+      format_item = function(p)
+        return (M._pr_line(p, me))
+      end,
+    }, function(p)
+      if p then
+        choose(p)
+      end
+    end)
+  end
+  local finders, conf = require('telescope.finders'), require('telescope.config').values
+  local actions, state = require('telescope.actions'), require('telescope.actions.state')
+  pickers
+    .new({}, {
+      prompt_title = 'Review PR  (' .. PR_LEGEND .. ')',
+      finder = finders.new_table({
+        results = prs,
+        entry_maker = function(p)
+          local text, hls = M._pr_line(p, me)
+          return {
+            value = p,
+            ordinal = ('#%d %s %s %s'):format(p.number, p.title, p.headRefName, p.author.login),
+            display = function()
+              return text, hls
+            end,
+          }
+        end,
+      }),
+      sorter = conf.generic_sorter({}),
+      attach_mappings = function(bufnr)
+        actions.select_default:replace(function()
+          local entry = state.get_selected_entry()
+          actions.close(bufnr)
+          if entry then
+            choose(entry.value)
+          end
+        end)
+        return true
+      end,
+    })
+    :find()
+end
+
 -- Review PR n without touching this checkout: use the worktree that already has its branch
 -- (e.g. the agent's), else check it out into a fresh one. No n: pick from open PRs.
 function M.pr(n)
   if not n then
     return gh.list(function(prs)
-      vim.ui.select(prs, {
-        prompt = 'Review PR',
-        format_item = function(p)
-          return ('#%d %s  (%s, @%s)'):format(p.number, p.title, p.headRefName, p.author.login)
-        end,
-      }, function(p)
-        if p then
+      gh.me(function(me)
+        pick_pr(prs, me, function(p)
           vim.schedule(function()
             M.pr(p.number)
           end)
-        end
+        end)
       end)
     end)
   end
@@ -907,28 +1292,73 @@ function M.pr(n)
   end)
 end
 
--- Full-file side-by-side for the file window, against the file's review base.
-local function open_split()
+-- Full-file side-by-side for the file window: the file at its review base, read straight from git
+-- into a read-only pane on the left, diffed with Vim's own :diffthis. (Not gitsigns' diffthis: it
+-- builds that pane from a cached base that can lag behind a just-switched one, which showed whole-PR
+-- diffs after <leader>rv.) Says why when it can't, unless quiet (only following you between files).
+local function open_split(quiet)
   local w = file_window()
   if not w then
     return
   end
   vim.api.nvim_set_current_win(w)
-  local rel = S and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(0))
-  require('gitsigns').diffthis(rel and base_for(rel) or nil, { vertical = true }, function()
-    vim.schedule(function()
-      for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-        if vim.wo[win].diff then
-          vim.wo[win].foldenable = false
-        end
-      end
+  local buf = vim.api.nvim_win_get_buf(w)
+  local function why(msg)
+    if not quiet then
+      vim.notify('overwatch: ' .. msg, WARN)
+    end
+  end
+  if vim.bo[buf].buftype ~= '' then
+    return why('side-by-side needs a file in the repo, not ' .. vim.api.nvim_buf_get_name(buf))
+  end
+  local root = S and S.root or git('rev-parse', '--show-toplevel')
+  local rel = root and vim.fs.relpath(root, vim.api.nvim_buf_get_name(buf))
+  if not rel then
+    return why("this file isn't in a git repo")
+  end
+  -- in a review, the file's review base; otherwise the index, as gitsigns does
+  local base = S and base_for(rel) or ''
+  local r = vim.system({ 'git', 'show', base .. ':' .. rel }, { cwd = root, text = true }):wait()
+  -- a file that didn't exist at the base gets an empty pane: all of it is new
+  local lines = r.code == 0 and vim.split(r.stdout, '\n', { plain = true }) or {}
+  if lines[#lines] == '' then
+    table.remove(lines)
+  end
+  if vim.bo[buf].fileformat == 'dos' then
+    for i, l in ipairs(lines) do
+      lines[i] = l:gsub('\r$', '')
+    end
+  end
+  local name = base_name(base ~= '' and base or 'index', rel)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b) == name then
+      pcall(vim.api.nvim_buf_delete, b, { force = true })
+    end
+  end
+  local bbuf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(bbuf, 0, -1, false, lines)
+  vim.bo[bbuf].modifiable = false
+  vim.bo[bbuf].bufhidden = 'wipe'
+  vim.bo[bbuf].filetype = vim.bo[buf].filetype
+  pcall(vim.api.nvim_buf_set_name, bbuf, name)
+  if vim.wo[w].diff then
+    vim.api.nvim_win_call(w, function()
+      vim.cmd.diffoff() -- left over from a pane closed by hand
     end)
-  end)
+  end
+  local bw = vim.api.nvim_open_win(bbuf, false, { split = 'left', win = w })
+  for _, win in ipairs({ bw, w }) do
+    vim.api.nvim_win_call(win, function()
+      vim.cmd.diffthis()
+    end)
+    vim.wo[win].foldenable = false
+  end
 end
 
--- Toggle side-by-side. It's a mode: it stays on as you move between files until toggled off.
+-- Toggle side-by-side by what's on screen: base panes showing, close them; otherwise open one. It's
+-- a mode: once on, it follows you between files until you toggle it off.
 function M.diff()
-  if close_split() or (S and S.split) then
+  if close_split() then
     if S then
       S.split = false
     end
@@ -943,38 +1373,44 @@ end
 -- The side-by-side view follows you: when the file pane moves to another file (<leader>rv, ]q,
 -- the tree, :e), swap the base pane for that file's; a non-file (deleted file view) closes it.
 local function follow_split(win, buf)
-  if not (S and S.split and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf) or is_base_pane(win) or win == nav_win() then
+  if not (S and S.split and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf) then
+    return
+  end
+  if is_base_pane(win) or win == nav_win() or win == S.goto_win then
     return
   end
   local rel = vim.bo[buf].buftype == '' and vim.fs.relpath(S.root, vim.api.nvim_buf_get_name(buf))
+  local want = rel and base_name(base_for(rel), rel)
   for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    local name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w))
-    if rel and name:match('^gitsigns://') and name:sub(-#rel - 1) == ':' .. rel then
-      return -- already paired with this file
+    if want and vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w)) == want then
+      return -- already paired with this file at its base
     end
   end
   close_split()
   if rel then
-    -- diffthis needs gitsigns attached, and a file that was just opened isn't yet: finish on its
-    -- first update (see setup)
-    S.split_for = { win = win, buf = buf }
-    local sd = vim.b[buf].gitsigns_status_dict
-    if sd and sd.added then
-      M._resplit(buf)
-    end
+    vim.api.nvim_set_current_win(win)
+    open_split(true)
   end
 end
 
-function M._resplit(buf)
-  local want = S and S.split_for
-  if not (want and want.buf == buf) then
-    return
+-- Goto during a review (wrap a telescope LSP picker, e.g. lsp_definitions): the result opens in one
+-- pane to the right, a plain editable buffer, so the file you're reviewing stays put. The lookup
+-- still uses your cursor in the review window. Outside a review it just runs the picker.
+-- ponytail: a lookup that finds nothing leaves a new pane showing the reviewed file
+function M.in_pane(picker)
+  if not S then
+    return picker()
   end
-  S.split_for = nil
-  if vim.api.nvim_win_is_valid(want.win) and vim.api.nvim_win_get_buf(want.win) == buf then
-    vim.api.nvim_set_current_win(want.win)
-    open_split()
+  local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+  if not (S.goto_win and vim.api.nvim_win_is_valid(S.goto_win)) then
+    S.goto_win = vim.api.nvim_open_win(buf, false, { split = 'right', win = win })
+    -- a split copies the review window's diff/scrollbind/fold settings; this pane is a plain one
+    for k, v in pairs({ diff = false, scrollbind = false, cursorbind = false, foldmethod = 'manual', foldenable = false }) do
+      vim.wo[S.goto_win][k] = v
+    end
   end
+  vim.api.nvim_set_current_win(S.goto_win)
+  picker({ bufnr = buf, winnr = win })
 end
 
 -- ]q / [q: the next/previous change from the cursor, through the file and on into the next file
@@ -1052,6 +1488,16 @@ function M.comment()
   if not (S and S.pr) then
     return vim.notify('overwatch: start a review on a branch with a PR first', WARN)
   end
+  if vim.api.nvim_get_current_buf() == S.convo_buf then
+    -- a reply links the comment under the cursor, so the agent knows what you're answering
+    local row = S.convo_rows and S.convo_rows[vim.fn.line('.')]
+    local c = row and row.comment
+    local context = c and vim.list_extend({ '@' .. who(c) .. ':' }, vim.split((c.body:gsub('\r', '')), '\n')) or {}
+    return input(c and 'Reply on the PR conversation' or 'PR comment', context, function(text)
+      local body = table.concat(text, '\n')
+      gh.pr_comment(S.pr.number, c and ('Re: ' .. c.url .. '\n\n' .. body) or body, refresh)
+    end)
+  end
   local l1, l2 = range()
   local _, rel = here()
   if not rel then
@@ -1074,8 +1520,28 @@ function M.comment()
   end)
 end
 
--- Resolve the PR thread on this line.
+-- Resolve the PR thread on this line; in the conversation, hide the comment as resolved.
 function M.resolve()
+  if S and vim.api.nvim_get_current_buf() == S.convo_buf then
+    local row = S.convo_rows and S.convo_rows[vim.fn.line('.')]
+    if not row then
+      return vim.notify('overwatch: no comment under the cursor', WARN)
+    end
+    -- the whole chain, so it collapses together on GitHub too
+    local todo = vim.tbl_filter(function(c)
+      return not c.isMinimized
+    end, row.thread.items)
+    local function hide(i)
+      if i > #todo then
+        vim.notify(('overwatch: hid %d comment%s as resolved'):format(#todo, #todo == 1 and '' or 's'))
+        return refresh()
+      end
+      gh.hide(todo[i].id, function()
+        hide(i + 1)
+      end)
+    end
+    return hide(1)
+  end
   local _, rel = here()
   if not rel then
     return
@@ -1107,11 +1573,18 @@ function M.verdict()
       return
     end
     vim.schedule(function()
-      input(kind .. ' PR #' .. n, {}, function(text)
-        gh.review(n, kind, table.concat(text, '\n'), function()
+      input(kind .. ' PR #' .. n .. ' (message optional)', {}, function(text)
+        local body = table.concat(text, '\n')
+        -- GitHub needs a message to request changes or comment; your comments usually say it all
+        if body == '' and kind == 'request-changes' then
+          body = 'Requesting changes: see my comments on this PR.'
+        elseif body == '' and kind == 'comment' then
+          return vim.notify('overwatch: a review comment needs some text; nothing was posted', WARN)
+        end
+        gh.review(n, kind, body, function()
           vim.notify(('overwatch: %s posted on PR #%d'):format(kind, n))
         end)
-      end, kind == 'approve')
+      end, true)
     end)
   end)
 end
@@ -1140,15 +1613,8 @@ function M.setup(opts)
     group = g,
     pattern = 'GitSignsUpdate',
     callback = function(a)
-      local buf = a.data and a.data.buffer
-      if buf then
-        apply_base(buf)
-        local sd = vim.b[buf].gitsigns_status_dict
-        if sd and sd.added then
-          vim.schedule(function()
-            M._resplit(buf)
-          end)
-        end
+      if a.data and a.data.buffer then
+        apply_base(a.data.buffer)
       end
     end,
   })

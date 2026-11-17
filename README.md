@@ -8,7 +8,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 ```lua
 {
-  dir = 'cyalen/overwatch.nvim',
+  'cyalen/overwatch.nvim',
   dependencies = { 'lewis6991/gitsigns.nvim' },
   cmd = 'Overwatch',
   opts = {},
@@ -31,7 +31,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 ## Using it
 
-1. **Start.** `<leader>rr` reviews the PR for the branch you're on. If the branch has no PR, it lets you pick one. Your current checkout stays as it is:
+1. **Start.** `<leader>rr` reviews the PR for the branch you're on. If the branch has no PR, it lets you pick one. Each PR in the picker is marked with a yellow `●` when it needs your review (no decision yet, or commits since your last review), a green `✓` when approved, or a red `✗` when changes were requested. The colours come from your theme when telescope is installed. Your current checkout stays as it is:
    - If the PR's branch is already checked out somewhere (for example the agent's worktree), the review opens there in a new tab, with `:tcd` pointing that tab at the worktree.
    - Otherwise, the PR is checked out into a fresh worktree at `.overwatch/pr-N` in the main checkout. Remove it with `git worktree remove` when you're done.
 
@@ -39,7 +39,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
    gitsigns diffs every buffer against the merge-base with the PR's base branch. `]c`/`[c` move between changes within a file. `]q`/`[q` move to the next or previous change after your cursor, carrying on into the next file.
 
-2. **Only what's new since your last review.** Say you reviewed commits A–C, which touched `x.sh` and `y.sh`, and ticked both. The agent then pushes commit D, which touches only `x.sh`. The next review shows just `x.sh`, diffed against what you saw, so only D's lines appear. Ticks are saved as you make them, and this survives rebases and force-pushes. To always open on the whole PR, set `opts = { since_last_review = false }`.
+2. **Only what's new since your last review.** "Your last review" is your last submitted review on GitHub (approve, request changes, or a comment with a body), or the files you ticked here, whichever is newer. Say you reviewed commits A–C, which touched `x.sh` and `y.sh`. The agent then pushes commit D, which touches only `x.sh`. The next review shows just `x.sh`, diffed against what you saw, so only D's lines appear. Ticks are saved as you make them, and this survives rebases and force-pushes. To always open on the whole PR, set `opts = { since_last_review = false }`.
 
    `<leader>rf` opens the file tree, a narrow directory tree with `+/-` counts and a `●` count of open PR threads. Each file shows:
    - `○` (gray): not reviewed;
@@ -57,6 +57,16 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 3. **Side by side.** `<leader>rd` shows the full file next to its review base. It stays on as you move between files, until you press it again.
 
+   **Goto during a review.** Wrap your LSP goto pickers with `in_pane`. During a review, their results then open in one reusable pane to the right, as a normal editable buffer, and the file you're reviewing stays where it is. Outside a review the pickers behave as usual. With telescope:
+
+   ```lua
+   local pane = function(picker) return function() require('overwatch').in_pane(picker) end end
+   vim.keymap.set('n', 'grd', pane(require('telescope.builtin').lsp_definitions))
+   vim.keymap.set('n', 'grr', pane(require('telescope.builtin').lsp_references))
+   ```
+
+   It works with any picker that takes `{ bufnr, winnr }` for where to look up the symbol, and opens its result in the current window.
+
 4. **Comment on anything.** `<leader>rc` comments on the line or selection, and the comment goes straight to the PR.
    - **Lines the PR changed:** an ordinary line comment.
    - **Other lines in a file the PR touches:** a comment on the file. It carries a link to the exact lines at the PR head and the code you selected, followed by your text.
@@ -67,11 +77,17 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 5. **Whose turn.** A `●` in the sign column marks each open thread, on the lines it's about (outdated threads sit at their original line). `]r`/`[r` cycle through them in a file. A thread is purple while you had the last word, and yellow once the agent (or anyone else) replies. The tree's `●` counts turn yellow the same way. Verify the fix, then `<leader>rx` resolves the thread. The agent never resolves anything itself.
 
-6. **Hand off.** `<leader>ra` copies the agent prompt. Paste it into any agent.
+6. **PR conversation.** Comments on the PR itself, rather than on code, live in the file tree as a `💬 PR conversation ●N` row, which is yellow when someone else spoke last in any discussion. GitHub's conversation is flat, so overwatch rebuilds the discussions:
+   - a reply that starts with `Re: <link>` joins the comment it links to (replies from nvim and from agents do this);
+   - so does one made with GitHub's "Quote reply".
 
-7. **Verdict.** `<leader>rs` approves, requests changes, or leaves a review comment.
+   N counts discussions, not comments. `<CR>` opens the conversation in the main window. There, each discussion is one entry, with its replies indented under it. `]r`/`[r` move between discussions. `<leader>rc` replies into the one under the cursor. `<leader>rx` hides the whole discussion on GitHub as resolved. If a review starts with no code to look at but comments waiting on you, the conversation opens by itself. Files with a thread waiting on you show in the tree even when their code hasn't changed.
 
-Comments posted to the main conversation (point 4, for files the PR doesn't touch) aren't shown inline. The agent still picks them up.
+7. **Hand off.** `<leader>ra` copies the agent prompt. Paste it into any agent.
+
+8. **Verdict.** `<leader>rs` approves, requests changes, or leaves a review comment.
+
+Comments posted to the main conversation (point 4, for files the PR doesn't touch) appear in the PR conversation (point 6), not inline in the file.
 
 ## Bring your own agent
 
