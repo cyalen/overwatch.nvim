@@ -62,11 +62,14 @@ assert(ow._utc_epoch('2024-02-29T12:00:00Z') == 1709208000, 'leap day')
 
 -- PR picker status
 local function review(state, oid, at) return { author = { login = 'me' }, state = state, commit = { oid = oid }, body = '', submittedAt = at or '2026-01-01T00:00:00Z' } end
-assert(ow._pr_status({ reviewDecision = 'REVIEW_REQUIRED', headRefOid = 'h', reviews = {} }, 'me') == '🟡', 'never reviewed')
-assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = { review('APPROVED', 'h') } }, 'me') == '✅', 'approved at head')
-assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h', reviews = { review('CHANGES_REQUESTED', 'h') } }, 'me') == '❌', 'changes requested at head')
-assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h2', reviews = { review('CHANGES_REQUESTED', 'h1') } }, 'me') == '🟡', 'agent pushed since you requested changes')
-assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = {} }, 'me') == '✅', 'approved by someone else')
-assert(ow._pr_status({ reviewDecision = '', headRefOid = 'h', reviews = {} }, 'me') == '🟡', 'no review rules on the repo')
+assert(ow._pr_status({ reviewDecision = 'REVIEW_REQUIRED', headRefOid = 'h', reviews = {} }, 'me') == 'review', 'never reviewed')
+assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = { review('APPROVED', 'h') } }, 'me') == 'approved', 'approved at head')
+assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h', reviews = { review('CHANGES_REQUESTED', 'h') } }, 'me') == 'changes', 'changes requested at head')
+assert(ow._pr_status({ reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h2', reviews = { review('CHANGES_REQUESTED', 'h1') } }, 'me') == 'review', 'agent pushed since you requested changes')
+assert(ow._pr_status({ reviewDecision = 'APPROVED', headRefOid = 'h', reviews = {} }, 'me') == 'approved', 'approved by someone else')
+assert(ow._pr_status({ reviewDecision = '', headRefOid = 'h', reviews = {} }, 'me') == 'review', 'no review rules on the repo')
+
+local line, hls = ow._pr_line({ number = 7, title = 'T', headRefName = 'b', author = { login = 'x' }, reviewDecision = 'CHANGES_REQUESTED', headRefOid = 'h', reviews = {} }, 'me')
+assert(line == '✗ #7 T  (b, @x)' and hls[1][2] == 'DiagnosticError' and hls[1][1][2] == #'✗', line)
 
 print('ok')

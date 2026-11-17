@@ -1056,6 +1056,7 @@ function M._begin(root, base, n, tab, pr, me)
       return vim.notify('overwatch: no base found, pass one: :Overwatch <rev>', ERROR)
     end
   end
+  gh.cwd = root
   local file = seen_file(root)
   local rv = pr and me and M._last_review(pr.reviews, me)
   local reviewed = rv and rv.commit.oid
@@ -1118,6 +1119,7 @@ function M.stop()
   gs.toggle_word_diff(false)
   local tab, nav, convo = S and S.tab, S and S.nav, S and S.convo_buf
   S = nil
+  gh.cwd = nil
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     vim.b[b].overwatch_base = nil
   end
@@ -1173,16 +1175,79 @@ local function open_tree(path, n)
   M.start(nil, n, tab)
 end
 
--- The PR picker's status mark. Emoji, because vim.ui.select can't colour text.
---   🟡 needs your review: nobody's decided yet, or there are commits since your last review
---   ✅ approved
---   ❌ changes requested
+-- A PR's review status for the picker:
+--   'review'   needs your review: nobody's decided yet, or there are commits since your last review
+--   'approved' approved
+--   'changes'  changes requested
 function M._pr_status(p, me)
   local mine = M._last_review(p.reviews, me)
   if mine and mine.commit.oid ~= p.headRefOid then
-    return '🟡'
+    return 'review'
   end
-  return p.reviewDecision == 'APPROVED' and '✅' or p.reviewDecision == 'CHANGES_REQUESTED' and '❌' or '🟡'
+  return p.reviewDecision == 'APPROVED' and 'approved' or p.reviewDecision == 'CHANGES_REQUESTED' and 'changes' or 'review'
+end
+
+-- The same marks and theme colours as the file tree.
+local PR_MARKS = {
+  review = { '●', 'DiagnosticWarn' },
+  approved = { '✓', 'DiagnosticOk' },
+  changes = { '✗', 'DiagnosticError' },
+}
+local PR_LEGEND = '● needs review · ✓ approved · ✗ changes requested'
+
+-- One picker line: the text, and the mark's byte range + highlight.
+function M._pr_line(p, me)
+  local mark, hl = unpack(PR_MARKS[M._pr_status(p, me)])
+  local text = ('%s #%d %s  (%s, @%s)'):format(mark, p.number, p.title, p.headRefName, p.author.login)
+  return text, { { { 0, #mark }, hl } }
+end
+
+-- Pick a PR. With telescope, the marks are coloured from your theme; otherwise plain vim.ui.select.
+local function pick_pr(prs, me, choose)
+  local ok, pickers = pcall(require, 'telescope.pickers')
+  if not ok then
+    return vim.ui.select(prs, {
+      prompt = 'Review PR  (' .. PR_LEGEND .. ')',
+      format_item = function(p)
+        return (M._pr_line(p, me))
+      end,
+    }, function(p)
+      if p then
+        choose(p)
+      end
+    end)
+  end
+  local finders, conf = require('telescope.finders'), require('telescope.config').values
+  local actions, state = require('telescope.actions'), require('telescope.actions.state')
+  pickers
+    .new({}, {
+      prompt_title = 'Review PR  (' .. PR_LEGEND .. ')',
+      finder = finders.new_table({
+        results = prs,
+        entry_maker = function(p)
+          local text, hls = M._pr_line(p, me)
+          return {
+            value = p,
+            ordinal = ('#%d %s %s %s'):format(p.number, p.title, p.headRefName, p.author.login),
+            display = function()
+              return text, hls
+            end,
+          }
+        end,
+      }),
+      sorter = conf.generic_sorter({}),
+      attach_mappings = function(bufnr)
+        actions.select_default:replace(function()
+          local entry = state.get_selected_entry()
+          actions.close(bufnr)
+          if entry then
+            choose(entry.value)
+          end
+        end)
+        return true
+      end,
+    })
+    :find()
 end
 
 -- Review PR n without touching this checkout: use the worktree that already has its branch
@@ -1191,17 +1256,10 @@ function M.pr(n)
   if not n then
     return gh.list(function(prs)
       gh.me(function(me)
-        vim.ui.select(prs, {
-          prompt = 'Review PR  (🟡 needs review · ✅ approved · ❌ changes requested)',
-          format_item = function(p)
-            return ('%s #%d %s  (%s, @%s)'):format(M._pr_status(p, me), p.number, p.title, p.headRefName, p.author.login)
-          end,
-        }, function(p)
-          if p then
-            vim.schedule(function()
-              M.pr(p.number)
-            end)
-          end
+        pick_pr(prs, me, function(p)
+          vim.schedule(function()
+            M.pr(p.number)
+          end)
         end)
       end)
     end)
@@ -1515,11 +1573,18 @@ function M.verdict()
       return
     end
     vim.schedule(function()
-      input(kind .. ' PR #' .. n, {}, function(text)
-        gh.review(n, kind, table.concat(text, '\n'), function()
+      input(kind .. ' PR #' .. n .. ' (message optional)', {}, function(text)
+        local body = table.concat(text, '\n')
+        -- GitHub needs a message to request changes or comment; your comments usually say it all
+        if body == '' and kind == 'request-changes' then
+          body = 'Requesting changes: see my comments on this PR.'
+        elseif body == '' and kind == 'comment' then
+          return vim.notify('overwatch: a review comment needs some text; nothing was posted', WARN)
+        end
+        gh.review(n, kind, body, function()
           vim.notify(('overwatch: %s posted on PR #%d'):format(kind, n))
         end)
-      end, kind == 'approve')
+      end, true)
     end)
   end)
 end

@@ -1,9 +1,13 @@
 -- Thin async wrappers around the `gh` CLI. Everything runs as the reviewer's own gh auth.
 local M = {}
 
+-- The repo under review. Set while a review is active, so gh never depends on Neovim's current
+-- directory (which follows the current tab).
+M.cwd = nil
+
 -- cb gets decoded JSON (or raw stdout when it isn't JSON). on_err gets stderr; without it we notify.
 local function run(args, cb, on_err)
-  vim.system(vim.list_extend({ 'gh' }, args), { text = true }, function(r)
+  vim.system(vim.list_extend({ 'gh' }, args), { text = true, cwd = M.cwd }, function(r)
     vim.schedule(function()
       if r.code ~= 0 then
         if on_err then

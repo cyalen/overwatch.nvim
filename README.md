@@ -31,7 +31,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
 
 ## Using it
 
-1. **Start.** `<leader>rr` reviews the PR for the branch you're on. If the branch has no PR, it lets you pick one. Each PR in the picker is marked 🟡 when it needs your review (no decision yet, or commits since your last review), ✅ when approved, or ❌ when changes were requested. Your current checkout stays as it is:
+1. **Start.** `<leader>rr` reviews the PR for the branch you're on. If the branch has no PR, it lets you pick one. Each PR in the picker is marked with a yellow `●` when it needs your review (no decision yet, or commits since your last review), a green `✓` when approved, or a red `✗` when changes were requested. The colours come from your theme when telescope is installed. Your current checkout stays as it is:
    - If the PR's branch is already checked out somewhere (for example the agent's worktree), the review opens there in a new tab, with `:tcd` pointing that tab at the worktree.
    - Otherwise, the PR is checked out into a fresh worktree at `.overwatch/pr-N` in the main checkout. Remove it with `git worktree remove` when you're done.
 
