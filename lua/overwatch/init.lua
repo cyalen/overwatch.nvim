@@ -15,6 +15,8 @@ local SEP = '── reply ──'
 local SNIPPET_MAX = 20
 
 local S -- active review: { root, base, pr?, threads, convo, seen_file, tab?, ... }
+-- A review this copy picks up after a :Lazy reload (see the end of this file).
+local resume
 local convo_render -- the PR conversation buffer's renderer, defined with it below
 
 -- Runs in the reviewed tree while a review is active, so switching tabs doesn't matter.
@@ -1049,6 +1051,7 @@ function M.start(base, n, tab)
 end
 
 function M._begin(root, base, n, tab, pr, me)
+  local explicit_base = base
   if not base then
     local ref = pr and ('origin/' .. pr.baseRefName) or git('rev-parse', '--abbrev-ref', 'origin/HEAD')
     base = ref and git('merge-base', 'HEAD', ref)
@@ -1079,7 +1082,15 @@ function M._begin(root, base, n, tab, pr, me)
     bases = {},
     shown = {},
     all = not M.opts.since_last_review,
+    explicit_base = explicit_base,
   }
+  local resumed = resume
+  if resumed then
+    resume = nil
+    S.goto_win, S.split, S.all = resumed.goto_win, resumed.split, resumed.all
+  end
+  -- kept outside this module, so a reloaded copy of the plugin can pick the review back up
+  _G._overwatch_review = S
   ensure(root, file)
   S.seen0, S.seen0_at = read_seen()
 
@@ -1097,8 +1108,11 @@ function M._begin(root, base, n, tab, pr, me)
       local files = review_files()
       local qf = set_qf(files)
       S.empty = #qf == 0
-      if n and #qf > 0 then
+      if n and #qf > 0 and not resumed then
         vim.cmd.cfirst()
+      end
+      if resumed and resumed.tree then
+        M.files()
       end
       local todo = #vim.tbl_filter(to_review, files)
       local what = pr and ('PR #' .. pr.number) or 'no PR'
@@ -1119,6 +1133,7 @@ function M.stop()
   gs.toggle_word_diff(false)
   local tab, nav, convo = S and S.tab, S and S.nav, S and S.convo_buf
   S = nil
+  _G._overwatch_review = nil
   gh.cwd = nil
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     vim.b[b].overwatch_base = nil
@@ -1482,11 +1497,19 @@ function M.prev_comment()
   cycle(-1)
 end
 
+-- Why there's nowhere to post: no review running, or a review without a PR.
+local function no_pr()
+  if not S then
+    return vim.notify('overwatch: no review is running; start one with <leader>rr', WARN)
+  end
+  vim.notify("overwatch: this review has no PR on GitHub (gh found none for this branch), so there's nowhere to post", WARN)
+end
+
 -- PR comment on the line/range, or a reply if a thread is already there. Inside the diff it's a line
 -- comment; outside it, a file comment carrying a link to the lines and the code (see gh.comment).
 function M.comment()
   if not (S and S.pr) then
-    return vim.notify('overwatch: start a review on a branch with a PR first', WARN)
+    return no_pr()
   end
   if vim.api.nvim_get_current_buf() == S.convo_buf then
     -- a reply links the comment under the cursor, so the agent knows what you're answering
@@ -1496,6 +1519,21 @@ function M.comment()
     return input(c and 'Reply on the PR conversation' or 'PR comment', context, function(text)
       local body = table.concat(text, '\n')
       gh.pr_comment(S.pr.number, c and ('Re: ' .. c.url .. '\n\n' .. body) or body, refresh)
+    end)
+  end
+  if S.nav and vim.api.nvim_get_current_buf() == S.nav then
+    -- in the file tree: a comment on the whole file under the cursor (the 💬 row: on the PR itself)
+    local r = S.nav_rows and S.nav_rows[vim.fn.line('.')]
+    if r and r.convo then
+      return input('PR comment', {}, function(text)
+        gh.pr_comment(S.pr.number, table.concat(text, '\n'), refresh)
+      end)
+    end
+    if not (r and r.file) then
+      return vim.notify('overwatch: put the cursor on a file to comment on the whole file', WARN)
+    end
+    return input('File comment on ' .. r.file.path, {}, function(text)
+      gh.file_comment(S.pr, r.file.path, table.concat(text, '\n'), refresh)
     end)
   end
   local l1, l2 = range()
@@ -1565,7 +1603,7 @@ end
 
 function M.verdict()
   if not (S and S.pr) then
-    return vim.notify('overwatch: start a review on a branch with a PR first', WARN)
+    return no_pr()
   end
   local n = S.pr.number
   vim.ui.select({ 'approve', 'request-changes', 'comment' }, { prompt = 'Review PR #' .. n }, function(kind)
@@ -1648,6 +1686,29 @@ function M.setup(opts)
     end
     M.start(sub)
   end, { nargs = '*', desc = 'Toggle review | <rev>: review against rev | pr [N]: review a PR in its worktree | handoff' })
+end
+
+-- :Lazy reload (or anything else that loads this module again) during a review would orphan it: the
+-- old copy's file tree still on screen, nothing behind it. Pick the review back up in this copy.
+do
+  local previous = rawget(_G, '_overwatch_review')
+  if previous then
+    _G._overwatch_review = nil
+    vim.schedule(function()
+      local tree = previous.nav and vim.api.nvim_buf_is_valid(previous.nav) and #vim.fn.win_findbuf(previous.nav) > 0
+      for _, b in ipairs({ previous.nav, previous.convo_buf }) do
+        if b and vim.api.nvim_buf_is_valid(b) then
+          pcall(vim.api.nvim_buf_delete, b, { force = true })
+        end
+      end
+      if previous.tab and vim.api.nvim_tabpage_is_valid(previous.tab) then
+        vim.api.nvim_set_current_tabpage(previous.tab)
+      end
+      resume = { goto_win = previous.goto_win, split = previous.split, all = previous.all, tree = tree }
+      vim.notify('overwatch: plugin reloaded during a review; picking it back up')
+      M.start(previous.explicit_base, previous.pr and previous.pr.number, previous.tab)
+    end)
+  end
 end
 
 return M

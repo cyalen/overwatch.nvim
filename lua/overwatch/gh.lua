@@ -134,6 +134,25 @@ function M.comment(pr, c, cb)
   end)
 end
 
+-- A comment on a whole file (no lines). GitHub only takes file comments on files in the PR; for any
+-- other file it goes to the PR conversation instead, starting with a link to the file.
+function M.file_comment(pr, path, body, cb)
+  local args = { 'api', ('repos/{owner}/{repo}/pulls/%d/comments'):format(pr.number), '-f', 'commit_id=' .. pr.headRefOid }
+  vim.list_extend(args, { '-f', 'path=' .. path, '-f', 'subject_type=file', '-f', 'body=' .. body })
+  run(args, cb, function(err)
+    if not err:find('422') then
+      return vim.notify('overwatch: comment failed: ' .. vim.trim(err), vim.log.levels.ERROR)
+    end
+    local link = ('[`%s`](%s/blob/%s/%s)'):format(path, pr.url:match('^(.-)/pull/'), pr.headRefOid, path)
+    M.pr_comment(pr.number, link .. '\n\n' .. body, function(d)
+      vim.notify(('overwatch: %s isn\'t part of the PR, so that went to the PR conversation'):format(path))
+      if cb then
+        cb(d)
+      end
+    end)
+  end)
+end
+
 function M.reply(pr, comment_id, body, cb)
   run({ 'api', ('repos/{owner}/{repo}/pulls/%d/comments/%d/replies'):format(pr, comment_id), '-f', 'body=' .. body }, cb)
 end
