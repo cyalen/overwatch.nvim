@@ -72,6 +72,7 @@ Requires [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim), the [`gh`]
    - **Other lines in a file the PR touches:** a comment on the file. It carries a link to the exact lines at the PR head and the code you selected, followed by your text.
    - **Files the PR doesn't touch:** the same comment, posted to the PR's main conversation. GitHub doesn't allow review comments on those files.
    - **A line that already has a thread:** shows the thread, and you reply to it.
+   - **A whole file:** press `<leader>rc` on the file in the file tree. The comment sits at the top of the file, like any thread. On the `💬 PR conversation` row, `<leader>rc` starts a new comment on the PR itself.
 
    Inside the float, `<CR>` in normal mode sends and `q` cancels.
 
